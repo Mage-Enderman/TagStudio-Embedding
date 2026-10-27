@@ -77,6 +77,15 @@ class AppSettings(BaseModel):
     splash: Splash = Field(default=Splash.DEFAULT)
     windows_start_command: bool = Field(default=False)
 
+    # Optional EmbeddingGemma 2 powered features
+    embeddings_enabled: bool = Field(default=True)
+    embeddings_model: str = Field(default="google/embeddinggemma-2")
+    embeddings_dimensions: int = Field(default=256)
+    embeddings_device: str = Field(default="auto")
+    embeddings_use_images: bool = Field(default=True)
+    auto_tag_threshold: float = Field(default=0.6)
+    auto_tag_max_suggestions: int = Field(default=5)
+
     date_format: str = Field(default="%x")
     hour_format: bool = Field(default=True)
     zero_padding: bool = Field(default=True)

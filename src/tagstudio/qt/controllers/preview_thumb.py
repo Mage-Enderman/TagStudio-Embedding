@@ -169,6 +169,11 @@ class PreviewThumb(PreviewThumbView):
             self.__driver.delete_files_callback(self._current_file)
 
     @override
+    def _auto_tag_action_callback(self):
+        if self._current_file:
+            self.__driver.auto_tag_callback()
+
+    @override
     def _button_wrapper_callback(self):
         if self._current_file:
             open_file(

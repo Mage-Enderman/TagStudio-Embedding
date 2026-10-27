@@ -57,7 +57,7 @@ class TagBoxWidget(TagBoxWidgetView):
                 self.__driver.update_browsing_state(
                     current.with_search_query(
                         f"{current.query} {suffix}" if current.query else suffix
-                    )
+                    ).with_semantic(semantic=False)
                 )
 
     @override

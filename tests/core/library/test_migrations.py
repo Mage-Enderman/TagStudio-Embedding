@@ -3,6 +3,7 @@
 
 
 import shutil
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -56,6 +57,30 @@ def test_library_migrations(path: str):
         raise (e)
     finally:
         shutil.rmtree(temp_path)
+
+
+def test_migration_401_creates_entry_embeddings_table(tmp_path: Path):
+    library = Library()
+    assert library.open_library(library_dir=tmp_path).success
+    library.close()
+
+    database_path = tmp_path / TS_FOLDER_NAME / SQL_FILENAME
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("DROP TABLE entry_embeddings")
+        connection.execute("UPDATE versions SET value = 400 WHERE key = 'CURRENT'")
+        connection.commit()
+
+    library = Library()
+    try:
+        assert library.open_library(library_dir=tmp_path).success
+        with sqlite3.connect(database_path) as connection:
+            tables = {
+                row[0]
+                for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+            }
+        assert "entry_embeddings" in tables
+    finally:
+        library.close()
 
 
 def test_migration_with_existing_field_template_tables(tmp_path: Path):

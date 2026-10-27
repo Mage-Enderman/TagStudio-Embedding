@@ -43,6 +43,14 @@ dependencies = [
     "wcmatch==10.*",
 ]
 
+[project.optional-dependencies]
+# Optional local semantic search / auto-tagging via EmbeddingGemma 2.
+embeddings = [
+    "sentence-transformers[image]>=6.1.0",
+    "transformers>=4.57",
+    "torchvision",
+]
+
 [project.gui-scripts]
 tagstudio = "tagstudio.__main__:main"
 

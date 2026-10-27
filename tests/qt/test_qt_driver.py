@@ -2,6 +2,9 @@
 # SPDX-License-Identifier: GPL-3.0-only
 
 
+from typing import cast
+from unittest.mock import Mock
+
 from tagstudio.core.library.alchemy.enums import BrowsingState
 from tagstudio.core.utils.types import unwrap
 from tagstudio.qt.qt_driver import QtDriver
@@ -37,6 +40,27 @@ def test_browsing_state_update(qt_driver: QtDriver):
     assert len(qt_driver.frame_content) == 1
     entry = unwrap(qt_driver.lib.get_entry_full(qt_driver.frame_content[0]))
     assert list(entry.tags)[0].name == "bar"
+
+
+def test_build_search_state_uses_semantic_mode(qt_driver: QtDriver):
+    main_window = cast(Mock, qt_driver.main_window)
+    main_window.search_field.text.return_value = "a fluffy kitten"
+    main_window.semantic_search_enabled = True
+
+    state = qt_driver.build_search_state()
+    assert state.semantic
+    assert state.query == "a fluffy kitten"
+
+    # Semantic mode is remembered even before the user types a query.
+    main_window.search_field.text.return_value = ""
+    assert qt_driver.build_search_state().semantic
+
+    main_window.search_field.text.return_value = "a fluffy kitten"
+    main_window.semantic_search_enabled = False
+
+    state = qt_driver.build_search_state()
+    assert not state.semantic
+    assert state.query == "a fluffy kitten"
 
 
 def test_close_library(qt_driver: QtDriver):

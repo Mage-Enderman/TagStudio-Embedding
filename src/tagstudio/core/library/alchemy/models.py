@@ -2,11 +2,12 @@
 # SPDX-License-Identifier: GPL-3.0-only
 
 
+from datetime import UTC
 from datetime import datetime as dt
 from pathlib import Path
 from typing import override
 
-from sqlalchemy import ForeignKey, ForeignKeyConstraint, Integer
+from sqlalchemy import ForeignKey, ForeignKeyConstraint, Index, Integer, LargeBinary, String
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from tagstudio.core.constants import TAG_ARCHIVED, TAG_FAVORITE
@@ -269,6 +270,50 @@ class Entry(Base):
     def remove_tag(self, tag: Tag) -> None:
         """Removes a Tag from the Entry."""
         self.tags.remove(tag)
+
+
+class EntryEmbedding(Base):
+    """A stored embedding vector for an Entry.
+
+    Multiple embedding tasks (e.g. document search and tag classification) can be stored
+    for the same entry. Vectors are packed ``float32`` arrays.
+    """
+
+    __tablename__ = "entry_embeddings"
+
+    entry_id: Mapped[int] = mapped_column(ForeignKey("entries.id"), primary_key=True)
+    model: Mapped[str] = mapped_column(String, primary_key=True)
+    task: Mapped[str] = mapped_column(String, primary_key=True)
+    dimensions: Mapped[int] = mapped_column(Integer, nullable=False)
+    vector: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    content_hash: Mapped[str] = mapped_column(String, nullable=False)
+    updated_at: Mapped[dt] = mapped_column(
+        nullable=False, default=lambda: dt.now(UTC), onupdate=lambda: dt.now(UTC)
+    )
+
+    __table_args__ = (
+        Index("ix_entry_embeddings_lookup", "model", "task", "dimensions"),
+        {"sqlite_autoincrement": False},
+    )
+
+    def __init__(
+        self,
+        entry_id: int,
+        model: str,
+        task: str,
+        dimensions: int,
+        vector: bytes,
+        content_hash: str,
+        updated_at: dt | None = None,
+    ) -> None:
+        super().__init__()
+        self.entry_id = entry_id
+        self.model = model
+        self.task = task
+        self.dimensions = dimensions
+        self.vector = vector
+        self.content_hash = content_hash
+        self.updated_at = updated_at or dt.now(UTC)
 
 
 class Version(Base):

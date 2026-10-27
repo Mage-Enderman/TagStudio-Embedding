@@ -44,6 +44,11 @@ import tagstudio.qt.resources_rc  # noqa: F401  # pyright: ignore[reportUnusedIm
 from tagstudio.core.constants import BUILD_TYPE, TAG_ARCHIVED, TAG_FAVORITE, VERSION
 from tagstudio.core.driver import DriverMixin
 from tagstudio.core.enums import AppCacheItems, MacroID, ShowFilepathOption
+from tagstudio.core.library.alchemy.embeddings import (
+    EmbeddingConfig,
+    EmbeddingUnavailableError,
+    IndexReport,
+)
 from tagstudio.core.library.alchemy.enums import BrowsingState, SortingModeEnum
 from tagstudio.core.library.alchemy.library import Library, OpenLibraryResult
 from tagstudio.core.library.alchemy.models import Entry
@@ -64,6 +69,7 @@ from tagstudio.qt.app_settings import DEFAULT_GLOBAL_SETTINGS_PATH, AppSettings,
 from tagstudio.qt.cache_manager import CacheManager
 from tagstudio.qt.controllers.changelog_modal import ChangelogModal
 from tagstudio.qt.controllers.edit_tag_panel import EditTagPanel
+from tagstudio.qt.controllers.embedding_index import EmbeddingIndexTask
 from tagstudio.qt.controllers.field_template_search_panel import FieldTemplateSearchPanel
 from tagstudio.qt.controllers.fix_ignored_modal import FixIgnoredEntriesModal
 from tagstudio.qt.controllers.ignore_modal import IgnoreModal
@@ -75,6 +81,7 @@ from tagstudio.qt.controllers.splash import SplashScreen
 from tagstudio.qt.controllers.tag_search_panel import TagSearchPanel
 from tagstudio.qt.controllers.update_available_message_box import UpdateAvailableMessageBox
 from tagstudio.qt.mixed.about_modal import AboutModal
+from tagstudio.qt.mixed.auto_tag_modal import AutoTagModal
 from tagstudio.qt.mixed.drop_import_modal import DropImportModal
 from tagstudio.qt.mixed.fix_dupe_files import FixDupeFilesModal
 from tagstudio.qt.mixed.fix_unlinked import FixUnlinkedEntriesModal
@@ -184,6 +191,7 @@ class QtDriver(DriverMixin, QObject):
     ignored_modal: FixIgnoredEntriesModal
     dupe_modal: FixDupeFilesModal
     library_info_window: LibraryInfoWindow
+    auto_tag_modal: AutoTagModal | None = None
 
     applied_theme: Theme
 
@@ -202,6 +210,8 @@ class QtDriver(DriverMixin, QObject):
         self.frame_content: list[int] = []  # List of Entry IDs for the current query
         self._selected: OrderedDict[int, None] = OrderedDict()
         self.pages_count = 0
+        self._embedding_index_task: EmbeddingIndexTask | None = None
+        self._embedding_progress: ProgressWidget | None = None
 
         self.scrollbar_pos = 0
         self.spacing = None
@@ -497,6 +507,10 @@ class QtDriver(DriverMixin, QObject):
             self.add_tag_modal.show
         )
 
+        self.main_window.menu_bar.auto_tag_selected_action.triggered.connect(
+            lambda checked=False: self.auto_tag_callback()
+        )
+
         self.main_window.menu_bar.delete_file_action.triggered.connect(
             lambda f="": self.delete_files_callback(f)
         )
@@ -582,6 +596,14 @@ class QtDriver(DriverMixin, QObject):
         # TODO: Move this to a settings screen.
         self.main_window.menu_bar.clear_thumb_cache_action.triggered.connect(
             lambda: unwrap(self.cache_manager).clear_cache()
+        )
+
+        # Semantic Index
+        self.main_window.menu_bar.build_semantic_index_action.triggered.connect(
+            lambda checked=False: self.call_if_library_open(self.build_semantic_index)
+        )
+        self.main_window.menu_bar.clear_semantic_index_action.triggered.connect(
+            lambda checked=False: self.call_if_library_open(self.clear_semantic_index)
         )
 
         # endregion
@@ -685,6 +707,21 @@ class QtDriver(DriverMixin, QObject):
         # Show the message box
         msg_box.exec()
 
+    def build_search_state(self) -> BrowsingState:
+        """Build a browsing state from the search field and the current UI toggles."""
+        query = self.main_window.search_field.text()
+        # In semantic mode the query is natural language, not the query language.
+        if self.main_window.semantic_search_enabled:
+            state = BrowsingState(query=query).with_semantic(semantic=True)
+        else:
+            state = BrowsingState.from_search_query(query)
+
+        return (
+            state.with_sorting_mode(self.main_window.sorting_mode)
+            .with_sorting_direction(self.main_window.sorting_direction)
+            .with_show_hidden_entries(self.main_window.show_hidden_entries)
+        )
+
     def init_library_window(self):
         # self._init_landing_page() # Taken care of inside the widget now
 
@@ -695,12 +732,7 @@ class QtDriver(DriverMixin, QObject):
 
         def _update_browsing_state():
             try:
-                self.update_browsing_state(
-                    BrowsingState.from_search_query(self.main_window.search_field.text())
-                    .with_sorting_mode(self.main_window.sorting_mode)
-                    .with_sorting_direction(self.main_window.sorting_direction)
-                    .with_show_hidden_entries(self.main_window.show_hidden_entries)
-                )
+                self.update_browsing_state(self.build_search_state())
             except ParsingError as e:
                 self.main_window.status_bar.showMessage(
                     f"{Translations['status.results.invalid_syntax']} "
@@ -713,6 +745,9 @@ class QtDriver(DriverMixin, QObject):
 
         # Search Field
         self.main_window.search_field.returnPressed.connect(_update_browsing_state)
+
+        # Semantic Search Toggle
+        self.main_window.semantic_search_button.toggled.connect(self.semantic_search_toggled)
 
         # Sorting Dropdowns
         self.main_window.sorting_mode_combobox.setCurrentIndex(
@@ -819,6 +854,7 @@ class QtDriver(DriverMixin, QObject):
         self.lib.close()
         self.cache_manager = None
         self.thumb_job_queue.queue.clear()
+        self.update_semantic_search_ui()
 
         if is_shutdown:
             return
@@ -852,6 +888,8 @@ class QtDriver(DriverMixin, QObject):
             self.main_window.menu_bar.fix_unlinked_entries_action.setEnabled(False)
             self.main_window.menu_bar.fix_ignored_entries_action.setEnabled(False)
             self.main_window.menu_bar.fix_dupe_files_action.setEnabled(False)
+            self.main_window.menu_bar.build_semantic_index_action.setEnabled(False)
+            self.main_window.menu_bar.clear_semantic_index_action.setEnabled(False)
             self.main_window.menu_bar.clear_thumb_cache_action.setEnabled(False)
             self.main_window.menu_bar.folders_to_tags_action.setEnabled(False)
             self.main_window.menu_bar.library_info_action.setEnabled(False)
@@ -863,6 +901,7 @@ class QtDriver(DriverMixin, QObject):
         # NOTE: Doesn't try to disable during tests
         if self.main_window.menu_bar.add_tag_to_selected_action:
             self.main_window.menu_bar.add_tag_to_selected_action.setEnabled(False)
+            self.main_window.menu_bar.auto_tag_selected_action.setEnabled(False)
 
         end_time = time.time()
         self.main_window.status_bar.showMessage(
@@ -922,8 +961,217 @@ class QtDriver(DriverMixin, QObject):
 
     def search_for_tag_callback(self, tag_id: int) -> None:
         """Callback to search for a given Tag ID."""
+        self.main_window.set_semantic_search(False)
         self.main_window.search_field.setText(f"tag_id:{tag_id}")
         self.update_browsing_state(BrowsingState.from_tag_id(tag_id, self.browsing_history.current))
+
+    def semantic_search_toggled(self, enabled: bool) -> None:
+        """Re-run the current query when semantic search is toggled."""
+        if not self.lib.library_dir:
+            return
+
+        semantic_index = self.lib.semantic_index
+        missing_index = bool(enabled and semantic_index and not semantic_index.has_index())
+
+        self.main_window.search_field.setPlaceholderText(
+            Translations["home.semantic_search.placeholder"]
+            if enabled
+            else Translations["home.search_entries"]
+        )
+
+        try:
+            self.update_browsing_state(self.build_search_state())
+        except ParsingError:
+            self.main_window.status_bar.showMessage(
+                f"{Translations['status.results.invalid_syntax']} "
+                f'"{self.main_window.search_field.text()}"'
+            )
+            return
+
+        # Keep this message visible instead of overwriting it with the result count.
+        if missing_index:
+            self.main_window.status_bar.showMessage(Translations["home.semantic_search.no_index"])
+
+    def update_semantic_search_ui(self) -> None:
+        """Update the semantic search controls to match the current library/settings."""
+        available = bool(
+            self.lib.library_dir
+            and self.settings.embeddings_enabled
+            and self.lib.semantic_index is not None
+        )
+        self.main_window.set_semantic_search_available(available)
+        self.main_window.menu_bar.build_semantic_index_action.setEnabled(available)
+        self.main_window.menu_bar.clear_semantic_index_action.setEnabled(available)
+
+        # Leaving semantic mode behind would otherwise return empty results.
+        if not available and self.lib.library_dir and self.browsing_history.current.semantic:
+            self.update_browsing_state(self.browsing_history.current.with_semantic(semantic=False))
+
+    def configure_embeddings(self) -> None:
+        """Create or replace the library semantic index from the current settings."""
+        if not self.lib.library_dir or not self.settings.embeddings_enabled:
+            self.lib.semantic_index = None
+            return
+
+        config = EmbeddingConfig(
+            model=self.settings.embeddings_model,
+            dimensions=self.settings.embeddings_dimensions,
+            device=self.settings.embeddings_device,
+            use_images=self.settings.embeddings_use_images,
+        )
+        current = self.lib.semantic_index
+        if current is not None and current.config == config:
+            return
+
+        self.lib.configure_semantic_index(config)
+
+    def build_semantic_index(self) -> None:
+        """Build or refresh the semantic search index in the background."""
+        if not self.lib.library_dir:
+            return
+
+        if not self.settings.embeddings_enabled or self.lib.semantic_index is None:
+            self.show_error_message(
+                Translations["embeddings.disabled.title"],
+                Translations["embeddings.disabled.description"],
+            )
+            return
+
+        if self._embedding_index_task is not None:
+            self.main_window.status_bar.showMessage(
+                Translations["status.semantic_index_already_running"]
+            )
+            return
+
+        index = self.lib.semantic_index
+        progress_widget = ProgressWidget(
+            window_title=Translations["menu.tools.build_semantic_index"],
+            cancel_button_text=Translations["generic.cancel"],
+            minimum=0,
+            maximum=100,
+        )
+        progress_widget.update_label(Translations["status.semantic_index_building"])
+
+        task = EmbeddingIndexTask(index)
+
+        def on_stage(stage: str) -> None:
+            if stage == "loading_model":
+                progress_widget.pb.setRange(0, 0)
+                progress_widget.update_label(Translations["status.semantic_index_loading_model"])
+            else:
+                progress_widget.pb.setRange(0, 100)
+                progress_widget.update_progress(0)
+                progress_widget.update_label(Translations["status.semantic_index_building"])
+
+        def on_progress(done: int, total: int, label: str) -> None:
+            if total <= 0:
+                progress_widget.update_progress(0)
+                return
+            progress_widget.update_progress(int(done * 100 / total))
+            if label:
+                progress_widget.update_label(
+                    Translations.format(
+                        "status.semantic_index_progress",
+                        done=done,
+                        total=total,
+                        path=label,
+                    )
+                )
+
+        def on_finished(report: IndexReport) -> None:
+            progress_widget.hide()
+            progress_widget.deleteLater()
+            self._embedding_index_task = None
+            self._embedding_progress = None
+
+            if task.is_cancelled:
+                message = Translations["status.semantic_index_cancelled"]
+            else:
+                message = Translations.format(
+                    "status.semantic_index_built",
+                    indexed=report.indexed,
+                    skipped=report.skipped,
+                    failed=report.failed,
+                )
+            self.main_window.status_bar.showMessage(message)
+            if self.main_window.semantic_search_enabled:
+                self.update_browsing_state()
+
+        def on_failed(message: str) -> None:
+            progress_widget.hide()
+            progress_widget.deleteLater()
+            self._embedding_index_task = None
+            self._embedding_progress = None
+            self.show_error_message(
+                Translations["embeddings.unavailable.title"],
+                message,
+            )
+
+        task.stage.connect(on_stage)
+        task.progress.connect(on_progress)
+        task.finished.connect(on_finished)
+        task.failed.connect(on_failed)
+        progress_widget.pb.canceled.connect(task.cancel)
+
+        self._embedding_index_task = task
+        self._embedding_progress = progress_widget
+        progress_widget.show()
+
+        runnable = CustomRunnable(task.run)
+        QThreadPool.globalInstance().start(runnable)
+
+    def clear_semantic_index(self) -> None:
+        """Delete all stored embedding vectors."""
+        if not self.lib.library_dir:
+            return
+        count = self.lib.clear_entry_embeddings()
+        self.main_window.status_bar.showMessage(
+            Translations.format("status.semantic_index_cleared", count=count)
+        )
+
+    def auto_tag_callback(self, origin_id: int | None = None) -> None:
+        """Open the automatic tag preview for the current selection or one entry."""
+        if not self.lib.library_dir:
+            return
+
+        if not self.settings.embeddings_enabled or self.lib.semantic_index is None:
+            self.show_error_message(
+                Translations["embeddings.disabled.title"],
+                Translations["embeddings.disabled.description"],
+            )
+            return
+
+        selected = self.selected
+        if origin_id is not None and origin_id in selected and len(selected) > 1:
+            entry_ids = selected
+        elif origin_id is not None:
+            entry_ids = [origin_id]
+        else:
+            entry_ids = selected
+
+        if not entry_ids:
+            return
+
+        self.auto_tag_modal = AutoTagModal(self, entry_ids)
+        self.auto_tag_modal.show()
+
+    def apply_auto_tags(self, suggestions: list[tuple[int, int]]) -> None:
+        """Apply ``(entry_id, tag_id)`` pairs chosen in the auto-tag preview."""
+        grouped: dict[int, list[int]] = {}
+        for entry_id, tag_id in suggestions:
+            grouped.setdefault(entry_id, []).append(tag_id)
+
+        for entry_id, tag_ids in grouped.items():
+            self.lib.add_tags_to_entries(entry_id, tag_ids)
+            self.main_window.thumb_layout.add_tags([entry_id], tag_ids)
+
+        self.emit_badge_signals(
+            list({tag_id for _entry_id, tag_id in suggestions}), emit_on_absent=False
+        )
+        self.main_window.preview_panel.set_selection(self.selected)
+        self.main_window.status_bar.showMessage(
+            Translations.format("auto_tag.applied", count=len(suggestions))
+        )
 
     def select_all_action_callback(self):
         """Set the selection to all visible items."""
@@ -1343,14 +1591,26 @@ class QtDriver(DriverMixin, QObject):
             self.main_window.menu_bar.select_all_action.setEnabled(False)
             self.main_window.menu_bar.select_inverse_action.setEnabled(False)
 
+        auto_tag_action = self.main_window.menu_bar.auto_tag_selected_action
+        auto_tag_available = bool(
+            self.settings.embeddings_enabled and self.lib.semantic_index is not None
+        )
         if self.selected:
             self.main_window.menu_bar.add_tag_to_selected_action.setEnabled(True)
             self.main_window.menu_bar.clear_select_action.setEnabled(True)
             self.main_window.menu_bar.delete_file_action.setEnabled(True)
+            auto_tag_action.setEnabled(auto_tag_available)
+            auto_tag_action.setText(
+                Translations["menu.edit.auto_tag_selected.singular"]
+                if len(self.selected) == 1
+                else Translations["menu.edit.auto_tag_selected.plural"]
+            )
         else:
             self.main_window.menu_bar.add_tag_to_selected_action.setEnabled(False)
             self.main_window.menu_bar.clear_select_action.setEnabled(False)
             self.main_window.menu_bar.delete_file_action.setEnabled(False)
+            auto_tag_action.setEnabled(False)
+            auto_tag_action.setText(Translations["menu.edit.auto_tag_selected.plural"])
 
     def update_completions_list(self, text: str) -> None:
         matches = re.search(
@@ -1486,6 +1746,15 @@ class QtDriver(DriverMixin, QObject):
         if state:
             self.browsing_history.push(state)
 
+        # Keep the search bar toggle in sync when navigating back to older results.
+        semantic_available = bool(
+            self.settings.embeddings_enabled and self.lib.semantic_index is not None
+        )
+        if self.browsing_history.current.semantic and not semantic_available:
+            self.browsing_history.push(self.browsing_history.current.with_semantic(semantic=False))
+        if self.main_window.semantic_search_enabled != self.browsing_history.current.semantic:
+            self.main_window.set_semantic_search(self.browsing_history.current.semantic)
+
         self.main_window.search_field.setText(self.browsing_history.current.query or "")
 
         # inform user about running search
@@ -1495,7 +1764,18 @@ class QtDriver(DriverMixin, QObject):
         # search the library
         start_time = time.time()
         Ignore.get_patterns(self.lib.library_dir, include_global=True)
-        results = self.lib.search_library(self.browsing_history.current, page_size=0)
+        try:
+            results = self.lib.search_library(self.browsing_history.current, page_size=0)
+        except EmbeddingUnavailableError as e:
+            logger.error("[Embeddings] Semantic search failed", error=e)
+            self.main_window.set_semantic_search(False)
+            # Drop semantic mode so later refreshes don't retry the failed model load.
+            if self.browsing_history.current.semantic:
+                self.browsing_history.push(
+                    self.browsing_history.current.with_semantic(semantic=False)
+                )
+            self.show_error_message(Translations["embeddings.unavailable.title"], str(e))
+            return
         logger.info("items to render", count=len(results))
         end_time = time.time()
 
@@ -1710,6 +1990,7 @@ class QtDriver(DriverMixin, QObject):
         assert self.lib.library_dir
         self.init_workers()
         Ignore.get_patterns(self.lib.library_dir, include_global=True)
+        self.configure_embeddings()
         self.__reset_navigation()
 
         if self.settings.scan_files_on_open:
@@ -1749,6 +2030,7 @@ class QtDriver(DriverMixin, QObject):
         self.main_window.menu_bar.clear_thumb_cache_action.setEnabled(True)
         self.main_window.menu_bar.folders_to_tags_action.setEnabled(True)
         self.main_window.menu_bar.library_info_action.setEnabled(True)
+        self.update_semantic_search_ui()
 
         self.main_window.preview_panel.set_selection(self.selected)
 

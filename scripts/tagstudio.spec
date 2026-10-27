@@ -5,6 +5,7 @@
 
 
 import argparse
+import importlib.util
 import platform
 from argparse import ArgumentParser
 from pathlib import Path
@@ -13,7 +14,7 @@ from tomllib import load
 from PyInstaller.building.api import COLLECT, EXE, PYZ
 from PyInstaller.building.build_main import Analysis
 from PyInstaller.building.osx import BUNDLE
-from PyInstaller.utils.hooks import collect_submodules
+from PyInstaller.utils.hooks import collect_dynamic_libs, collect_submodules
 
 parser = ArgumentParser()
 # HACK: Without this, the script will fail if empty arguments are passed.
@@ -42,12 +43,33 @@ datafiles = [
     ("../docs/changelog.md", "tagstudio/resources/changelog"),
 ]
 
+# EmbeddingGemma 2 is an optional feature. Include its runtime only when the
+# `embeddings` extra has been installed in the build environment, keeping
+# regular builds lightweight.
+embedding_hiddenimports = []
+embedding_binaries = []
+if importlib.util.find_spec("sentence_transformers") is not None:
+    embedding_hiddenimports = [
+        "sentence_transformers",
+        "transformers",
+        "torch",
+        "torchvision",
+        "huggingface_hub",
+        "safetensors",
+        "tokenizers",
+    ]
+    # torchvision 0.29+ loads its stable-ABI extensions at runtime instead of
+    # importing them, so PyInstaller's module analysis cannot discover them.
+    embedding_binaries = collect_dynamic_libs(
+        "torchvision", search_patterns=["*.dll", "*.pyd"]
+    )
+
 a = Analysis(
     [Path(project_root, "__main__.py")],
     pathex=[],
-    binaries=[],
+    binaries=embedding_binaries,
     datas=datafiles,
-    hiddenimports=collect_submodules("tagstudio.previews.renderers"),
+    hiddenimports=collect_submodules("tagstudio.previews.renderers") + embedding_hiddenimports,
     hookspath=[],
     hooksconfig={},
     excludes=[],

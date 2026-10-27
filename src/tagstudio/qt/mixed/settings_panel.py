@@ -10,16 +10,22 @@ from PySide6.QtGui import QDoubleValidator, QIntValidator
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
+    QDoubleSpinBox,
     QFormLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QSpinBox,
     QTabWidget,
     QVBoxLayout,
     QWidget,
 )
 
 from tagstudio.core.enums import ShowFilepathOption, TagClickActionOption, Theme
+from tagstudio.core.library.alchemy.embeddings import (
+    DEFAULT_EMBEDDING_MODEL,
+    SUPPORTED_EMBEDDING_DIMENSIONS,
+)
 from tagstudio.i18n.translations import DEFAULT_TRANSLATION, LANGUAGES, Translations
 from tagstudio.qt.app_settings import (
     DEFAULT_CACHED_THUMB_RES,
@@ -102,6 +108,7 @@ class SettingsPanel(ModalContent):
         self.appearance_settings_container = QWidget()
         self.localization_settings_container = QWidget()
         self.media_settings_container = QWidget()
+        self.embeddings_settings_container = QWidget()
 
         # Tabs
         self.tab_widget = QTabWidget()
@@ -121,6 +128,11 @@ class SettingsPanel(ModalContent):
 
         self.__build_media_settings()
         self.tab_widget.addTab(self.media_settings_container, Translations["settings.media"])
+
+        self.__build_embeddings_settings()
+        self.tab_widget.addTab(
+            self.embeddings_settings_container, Translations["settings.embeddings"]
+        )
 
         # self.__build_library_settings()
         # self.tab_widget.addTab(self.library_settings_container, Translations["settings.library"])
@@ -327,6 +339,101 @@ class SettingsPanel(ModalContent):
             Translations["settings.cached_thumb_resolution.label"], self.cached_thumb_res_container
         )
 
+    def __build_embeddings_settings(self):
+        form_layout = QFormLayout(self.embeddings_settings_container)
+        form_layout.setContentsMargins(6, 6, 6, 6)
+
+        description = QLabel(Translations["settings.embeddings.description"])
+        description.setWordWrap(True)
+        form_layout.addRow(description)
+
+        # Enable EmbeddingGemma 2
+        self.embeddings_enabled_checkbox = QCheckBox()
+        self.embeddings_enabled_checkbox.setChecked(self.driver.settings.embeddings_enabled)
+        form_layout.addRow(
+            Translations["settings.embeddings.enabled"], self.embeddings_enabled_checkbox
+        )
+
+        # Model
+        self.embeddings_model_line_edit = QLineEdit()
+        self.embeddings_model_line_edit.setText(
+            self.driver.settings.embeddings_model or DEFAULT_EMBEDDING_MODEL
+        )
+        form_layout.addRow(
+            Translations["settings.embeddings.model"], self.embeddings_model_line_edit
+        )
+
+        # Dimensions
+        self.embeddings_dimensions_combobox = QComboBox()
+        for dimensions in SUPPORTED_EMBEDDING_DIMENSIONS:
+            self.embeddings_dimensions_combobox.addItem(str(dimensions), dimensions)
+        dimensions = self.driver.settings.embeddings_dimensions
+        if dimensions not in SUPPORTED_EMBEDDING_DIMENSIONS:
+            dimensions = 256
+        self.embeddings_dimensions_combobox.setCurrentIndex(
+            SUPPORTED_EMBEDDING_DIMENSIONS.index(dimensions)
+        )
+        form_layout.addRow(
+            Translations["settings.embeddings.dimensions"], self.embeddings_dimensions_combobox
+        )
+
+        # Device
+        self.embeddings_device_combobox = QComboBox()
+        for device in ("auto", "cpu", "cuda", "mps"):
+            self.embeddings_device_combobox.addItem(
+                Translations[f"settings.embeddings.device.{device}"], device
+            )
+        device = self.driver.settings.embeddings_device
+        if device not in ("auto", "cpu", "cuda", "mps"):
+            device = "auto"
+        self.embeddings_device_combobox.setCurrentIndex(
+            ("auto", "cpu", "cuda", "mps").index(device)
+        )
+        form_layout.addRow(
+            Translations["settings.embeddings.device"], self.embeddings_device_combobox
+        )
+
+        # Include image content
+        self.embeddings_use_images_checkbox = QCheckBox()
+        self.embeddings_use_images_checkbox.setChecked(self.driver.settings.embeddings_use_images)
+        form_layout.addRow(
+            Translations["settings.embeddings.use_images"], self.embeddings_use_images_checkbox
+        )
+
+        # Auto-tag similarity threshold
+        self.auto_tag_threshold_spinbox = QDoubleSpinBox()
+        self.auto_tag_threshold_spinbox.setRange(0.0, 1.0)
+        self.auto_tag_threshold_spinbox.setSingleStep(0.05)
+        self.auto_tag_threshold_spinbox.setDecimals(2)
+        self.auto_tag_threshold_spinbox.setValue(self.driver.settings.auto_tag_threshold)
+        form_layout.addRow(
+            Translations["settings.embeddings.auto_tag_threshold"],
+            self.auto_tag_threshold_spinbox,
+        )
+
+        # Max auto-tag suggestions per file
+        self.auto_tag_max_spinbox = QSpinBox()
+        self.auto_tag_max_spinbox.setRange(1, 50)
+        self.auto_tag_max_spinbox.setValue(self.driver.settings.auto_tag_max_suggestions)
+        form_layout.addRow(
+            Translations["settings.embeddings.auto_tag_max"], self.auto_tag_max_spinbox
+        )
+
+        self.embeddings_option_widgets = [
+            self.embeddings_model_line_edit,
+            self.embeddings_dimensions_combobox,
+            self.embeddings_device_combobox,
+            self.embeddings_use_images_checkbox,
+            self.auto_tag_threshold_spinbox,
+            self.auto_tag_max_spinbox,
+        ]
+        self.embeddings_enabled_checkbox.toggled.connect(self.__set_embeddings_options_enabled)
+        self.__set_embeddings_options_enabled(self.embeddings_enabled_checkbox.isChecked())
+
+    def __set_embeddings_options_enabled(self, enabled: bool):
+        for widget in self.embeddings_option_widgets:
+            widget.setEnabled(enabled)
+
     def __build_localization_settings(self):
         form_layout = QFormLayout(self.localization_settings_container)
         form_layout.setContentsMargins(6, 6, 6, 6)
@@ -427,6 +534,14 @@ class SettingsPanel(ModalContent):
             "hour_format": self.hourformat_checkbox.isChecked(),
             "zero_padding": self.zeropadding_checkbox.isChecked(),
             "splash": self.splash_combobox.currentData(),
+            "embeddings_enabled": self.embeddings_enabled_checkbox.isChecked(),
+            "embeddings_model": self.embeddings_model_line_edit.text().strip()
+            or DEFAULT_EMBEDDING_MODEL,
+            "embeddings_dimensions": self.embeddings_dimensions_combobox.currentData(),
+            "embeddings_device": self.embeddings_device_combobox.currentData(),
+            "embeddings_use_images": self.embeddings_use_images_checkbox.isChecked(),
+            "auto_tag_threshold": self.auto_tag_threshold_spinbox.value(),
+            "auto_tag_max_suggestions": self.auto_tag_max_spinbox.value(),
         }
 
     def update_settings(self, driver: QtDriver):
@@ -455,8 +570,17 @@ class SettingsPanel(ModalContent):
         driver.settings.hour_format = settings["hour_format"]
         driver.settings.zero_padding = settings["zero_padding"]
         driver.settings.splash = Splash(settings["splash"]) or Splash.DEFAULT
+        driver.settings.embeddings_enabled = settings["embeddings_enabled"]
+        driver.settings.embeddings_model = settings["embeddings_model"]
+        driver.settings.embeddings_dimensions = settings["embeddings_dimensions"]
+        driver.settings.embeddings_device = settings["embeddings_device"]
+        driver.settings.embeddings_use_images = settings["embeddings_use_images"]
+        driver.settings.auto_tag_threshold = settings["auto_tag_threshold"]
+        driver.settings.auto_tag_max_suggestions = settings["auto_tag_max_suggestions"]
 
         driver.settings.save()
+        driver.configure_embeddings()
+        driver.update_semantic_search_ui()
 
         # Apply changes
         # Show File Path

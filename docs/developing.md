@@ -246,3 +246,33 @@ pyinstaller scripts/tagstudio.spec -- --portable
 ```
 
 The resulting executable file(s) will be located in a new folder named "dist".
+
+### Optional Embeddings Runtime
+
+Semantic search and automatic tagging rely on EmbeddingGemma 2 through the optional `embeddings` dependency group. The executable only bundles that runtime when it is installed in the build environment, so normal builds stay small. To build with embeddings support, install the extra before running PyInstaller:
+
+```sh
+uv sync --extra embeddings --group build
+pyinstaller scripts/tagstudio.spec
+```
+
+<!-- prettier-ignore -->
+!!! warning "Build size and model downloads"
+    The embeddings runtime includes PyTorch, which adds several gigabytes to the build output. The model weights are not bundled; they are downloaded from Hugging Face on first use, so the built application needs network access the first time embeddings are enabled.
+
+#### Building with CUDA
+
+The PyTorch wheel installed by `uv sync` is CPU-only. To build an executable that can use an NVIDIA GPU, replace PyTorch with a CUDA-enabled wheel that matches your driver before running PyInstaller:
+
+```sh
+uv pip install --python .venv --no-deps --reinstall \
+  "torch==2.14.1" "torchvision==0.29.1" \
+  --index-url https://download.pytorch.org/whl/cu130
+.venv/Scripts/pyinstaller.exe --noconfirm scripts/tagstudio.spec
+```
+
+CUDA wheels are available for Windows and Linux. On other platforms use `.venv/bin/pyinstaller`, and pick the index that matches your driver (for example `cu128` or `cu130`).
+
+Avoid `uv run pyinstaller` for a CUDA build: `uv run` re-syncs the environment from the lockfile and would replace the CUDA wheels with CPU-only ones. Running `uv sync` later has the same effect.
+
+If CUDA is selected in Settings but the installed PyTorch build has no CUDA support, TagStudio logs a warning and falls back to CPU instead of failing to load the model.

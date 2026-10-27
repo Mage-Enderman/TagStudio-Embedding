@@ -77,6 +77,8 @@ class PreviewThumbView(QWidget):
             self,
         )
         delete_action.triggered.connect(self._delete_action_callback)
+        auto_tag_action = QAction(Translations["auto_tag.menu.singular"], self)
+        auto_tag_action.triggered.connect(self._auto_tag_action_callback)
 
         self.__button_wrapper = QPushButton()
         self.__button_wrapper.setMinimumSize(*self.__img_button_size)
@@ -84,6 +86,7 @@ class PreviewThumbView(QWidget):
         self.__button_wrapper.setContextMenuPolicy(Qt.ContextMenuPolicy.ActionsContextMenu)
         self.__button_wrapper.addAction(open_file_action)
         self.__button_wrapper.addAction(open_explorer_action)
+        self.__button_wrapper.addAction(auto_tag_action)
         self.__button_wrapper.addAction(delete_action)
         self.__button_wrapper.clicked.connect(self._button_wrapper_callback)
 
@@ -98,6 +101,7 @@ class PreviewThumbView(QWidget):
         self.__preview_gif.setCursor(Qt.CursorShape.ArrowCursor)
         self.__preview_gif.addAction(open_file_action)
         self.__preview_gif.addAction(open_explorer_action)
+        self.__preview_gif.addAction(auto_tag_action)
         self.__preview_gif.addAction(delete_action)
         self.__gif_buffer: QBuffer = QBuffer()
 
@@ -107,6 +111,7 @@ class PreviewThumbView(QWidget):
         self.__media_player = MediaPlayer(driver)
         self.__media_player.addAction(open_file_action)
         self.__media_player.addAction(open_explorer_action)
+        self.__media_player.addAction(auto_tag_action)
         self.__media_player.addAction(delete_action)
         # QMediaPlayer loads duration asynchronously after setSource().
         self.__media_player.player.durationChanged.connect(
@@ -140,6 +145,9 @@ class PreviewThumbView(QWidget):
         raise NotImplementedError
 
     def _delete_action_callback(self):
+        raise NotImplementedError
+
+    def _auto_tag_action_callback(self):
         raise NotImplementedError
 
     def _button_wrapper_callback(self):

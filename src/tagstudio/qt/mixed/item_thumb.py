@@ -8,9 +8,17 @@ from pathlib import Path
 from typing import TYPE_CHECKING, override
 
 import structlog
-from PySide6.QtCore import QEvent, QMimeData, QSize, Qt, QUrl
+from PySide6.QtCore import QEvent, QMimeData, QPoint, QSize, Qt, QUrl
 from PySide6.QtGui import QAction, QDrag, QEnterEvent, QGuiApplication, QMouseEvent, QPixmap
-from PySide6.QtWidgets import QBoxLayout, QCheckBox, QHBoxLayout, QLabel, QVBoxLayout, QWidget
+from PySide6.QtWidgets import (
+    QBoxLayout,
+    QCheckBox,
+    QHBoxLayout,
+    QLabel,
+    QMenu,
+    QVBoxLayout,
+    QWidget,
+)
 
 from tagstudio.core.constants import TAG_ARCHIVED, TAG_FAVORITE
 from tagstudio.core.library.alchemy.enums import ItemType
@@ -188,13 +196,14 @@ class ItemThumb(FlowWidget):
         self.thumb_button = ThumbButton(self.thumb_container, thumb_size)
         self.thumb_button.setFlat(True)
         self.thumb_button.setLayout(self.thumb_layout)
-        self.thumb_button.setContextMenuPolicy(Qt.ContextMenuPolicy.ActionsContextMenu)
+        self.thumb_button.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.thumb_button.customContextMenuRequested.connect(self._show_context_menu)
 
         self.opener = FileOpenerHelper(Path())
-        open_file_action = QAction(Translations["file.open_file"], self)
-        open_file_action.triggered.connect(self.opener.open_file)
-        open_explorer_action = QAction(open_file_str(), self)
-        open_explorer_action.triggered.connect(self.opener.open_explorer)
+        self.open_file_action = QAction(Translations["file.open_file"], self)
+        self.open_file_action.triggered.connect(self.opener.open_file)
+        self.open_explorer_action = QAction(open_file_str(), self)
+        self.open_explorer_action.triggered.connect(self.opener.open_explorer)
 
         self.delete_action = QAction(
             Translations.format("trash.context.ambiguous", trash_term=trash_term()),
@@ -206,10 +215,6 @@ class ItemThumb(FlowWidget):
                 self.driver.delete_files_callback(self.item_path, self.item_id)
 
         self.delete_action.triggered.connect(lambda checked=False: _on_delete())
-
-        self.thumb_button.addAction(open_file_action)
-        self.thumb_button.addAction(open_explorer_action)
-        self.thumb_button.addAction(self.delete_action)
 
         # Static Badges ========================================================
 
@@ -307,6 +312,32 @@ class ItemThumb(FlowWidget):
         self.thumb_button.pressed.connect(self._on_thumb_pressed)
         self.thumb_button.clicked.connect(self._on_thumb_clicked)
         self.set_mode(mode)
+
+    def _show_context_menu(self, pos: QPoint) -> None:
+        if self.mode is not ItemType.ENTRY:
+            return
+
+        menu = QMenu(self)
+        menu.addAction(self.open_file_action)
+        menu.addAction(self.open_explorer_action)
+        menu.addSeparator()
+
+        if len(self.driver.selected) > 1 and self.item_id in self.driver.selected:
+            auto_tag_text = Translations["auto_tag.menu.plural"]
+        else:
+            auto_tag_text = Translations["auto_tag.menu.singular"]
+        auto_tag_action = QAction(auto_tag_text, menu)
+        auto_tag_action.setEnabled(self.driver.settings.embeddings_enabled)
+        auto_tag_action.triggered.connect(lambda checked=False: self._auto_tag())
+        menu.addAction(auto_tag_action)
+
+        menu.addSeparator()
+        menu.addAction(self.delete_action)
+        menu.exec(self.thumb_button.mapToGlobal(pos))
+
+    def _auto_tag(self) -> None:
+        if self.item_id != -1:
+            self.driver.auto_tag_callback(self.item_id)
 
     @property
     def is_favorite(self) -> bool:

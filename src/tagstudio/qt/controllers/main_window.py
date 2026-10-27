@@ -11,7 +11,7 @@ from typing import override
 import structlog
 from PIL import Image, ImageQt
 from PySide6 import QtCore, QtGui
-from PySide6.QtCore import QMetaObject, QSize, QStringListModel, Qt
+from PySide6.QtCore import QMetaObject, QSignalBlocker, QSize, QStringListModel, Qt
 from PySide6.QtGui import QAction, QPixmap
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -75,6 +75,7 @@ class MainMenuBar(QMenuBar):
     copy_fields_action: QAction
     paste_fields_action: QAction
     add_tag_to_selected_action: QAction
+    auto_tag_selected_action: QAction
     delete_file_action: QAction
     ignore_modal_action: QAction
     tag_manager_action: QAction
@@ -88,6 +89,8 @@ class MainMenuBar(QMenuBar):
     fix_unlinked_entries_action: QAction
     fix_ignored_entries_action: QAction
     fix_dupe_files_action: QAction
+    build_semantic_index_action: QAction
+    clear_semantic_index_action: QAction
     clear_thumb_cache_action: QAction
 
     macros_menu: QMenu
@@ -266,6 +269,13 @@ class MainMenuBar(QMenuBar):
         self.add_tag_to_selected_action.setEnabled(False)
         self.edit_menu.addAction(self.add_tag_to_selected_action)
 
+        # Automatically Tag Selected
+        self.auto_tag_selected_action = QAction(
+            Translations["menu.edit.auto_tag_selected.plural"], self
+        )
+        self.auto_tag_selected_action.setEnabled(False)
+        self.edit_menu.addAction(self.auto_tag_selected_action)
+
         self.edit_menu.addSeparator()
 
         # Move Files to trash
@@ -377,6 +387,22 @@ class MainMenuBar(QMenuBar):
         self.fix_dupe_files_action = QAction(Translations["menu.tools.fix_duplicate_files"], self)
         self.fix_dupe_files_action.setEnabled(False)
         self.tools_menu.addAction(self.fix_dupe_files_action)
+
+        self.tools_menu.addSeparator()
+
+        # Build Semantic Index
+        self.build_semantic_index_action = QAction(
+            Translations["menu.tools.build_semantic_index"], self
+        )
+        self.build_semantic_index_action.setEnabled(False)
+        self.tools_menu.addAction(self.build_semantic_index_action)
+
+        # Clear Semantic Index
+        self.clear_semantic_index_action = QAction(
+            Translations["menu.tools.clear_semantic_index"], self
+        )
+        self.clear_semantic_index_action.setEnabled(False)
+        self.tools_menu.addAction(self.clear_semantic_index_action)
 
         self.tools_menu.addSeparator()
 
@@ -581,6 +607,17 @@ class MainWindow(QMainWindow):
         self.search_field.setCompleter(self.search_field_completer)
         self.search_bar_layout.addWidget(self.search_field)
 
+        self.semantic_search_button = QPushButton(
+            Translations["home.semantic_search"], self.central_widget
+        )
+        self.semantic_search_button.setObjectName("semantic_search_button")
+        self.semantic_search_button.setCheckable(True)
+        # Enabled once a library with embeddings configured is open.
+        self.semantic_search_button.setEnabled(False)
+        self.semantic_search_button.setMinimumSize(QSize(0, 32))
+        self.semantic_search_button.setToolTip(Translations["home.semantic_search.tooltip"])
+        self.search_bar_layout.addWidget(self.semantic_search_button)
+
         self.search_button = QPushButton(Translations["home.search"], self.central_widget)
         self.search_button.setObjectName("search_button")
         self.search_button.setMinimumSize(QSize(0, 32))
@@ -752,6 +789,27 @@ class MainWindow(QMainWindow):
     def show_hidden_entries(self) -> bool:
         """Whether to show entries tagged with hidden tags."""
         return self.show_hidden_entries_checkbox.isChecked()
+
+    @property
+    def semantic_search_enabled(self) -> bool:
+        """Whether the search field is currently in semantic search mode."""
+        return self.semantic_search_button.isChecked()
+
+    def set_semantic_search(self, enabled: bool) -> None:
+        """Change the semantic search toggle without emitting a search."""
+        with QSignalBlocker(self.semantic_search_button):
+            self.semantic_search_button.setChecked(enabled)
+        self.search_field.setPlaceholderText(
+            Translations["home.semantic_search.placeholder"]
+            if enabled
+            else Translations["home.search_entries"]
+        )
+
+    def set_semantic_search_available(self, available: bool) -> None:
+        """Enable or disable the semantic search toggle."""
+        self.semantic_search_button.setEnabled(available)
+        if not available:
+            self.set_semantic_search(False)
 
     @override
     def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:

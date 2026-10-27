@@ -112,6 +112,7 @@ class DBMigrations:
             MigrationTo202,  # changes: tag_parents
             MigrationTo300,  # changes: deletes folders
             MigrationTo400,  # changes: add category_exclusions
+            MigrationTo401,  # changes: add entry_embeddings
         ]
         for migration in migrations:
             if self.loaded_db_version < migration.version and (
@@ -610,4 +611,30 @@ class MigrationTo400(DBMigration):
 
                 PRIMARY KEY (tag_id, category_id)
             )
+        """)
+
+
+class MigrationTo401(DBMigration):
+    version = 401
+
+    @override
+    @classmethod
+    def run(cls, conn: Connection, library_dir: Path, fmt_log):
+        logger.info(fmt_log("Creating entry_embeddings table..."))
+        conn.execute("""
+            CREATE TABLE entry_embeddings (
+                entry_id        INTEGER NOT NULL REFERENCES entries(id),
+                model           VARCHAR NOT NULL,
+                task            VARCHAR NOT NULL,
+                dimensions      INTEGER NOT NULL,
+                vector          BLOB NOT NULL,
+                content_hash    VARCHAR NOT NULL,
+                updated_at      DATETIME NOT NULL,
+
+                PRIMARY KEY (entry_id, model, task)
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX ix_entry_embeddings_lookup
+            ON entry_embeddings (model, task, dimensions)
         """)

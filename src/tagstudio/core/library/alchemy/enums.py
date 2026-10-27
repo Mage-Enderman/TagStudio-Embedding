@@ -89,6 +89,9 @@ class BrowsingState:
 
     show_hidden_entries: bool = False
 
+    # Treat the query as a natural-language semantic search instead of query language.
+    semantic: bool = False
+
     query: str | None = None
 
     # Abstract Syntax Tree Of the current Search Query
@@ -118,7 +121,8 @@ class BrowsingState:
         """
         logger.warning(state)
         if state:
-            return state.with_search_query(f"tag_id:{str(tag_id)}")
+            # A tag query belongs to the query language, not semantic search.
+            return state.with_search_query(f"tag_id:{str(tag_id)}").with_semantic(semantic=False)
         return cls(query=f"tag_id:{str(tag_id)}")
 
     @classmethod
@@ -154,3 +158,6 @@ class BrowsingState:
 
     def with_show_hidden_entries(self, show_hidden_entries: bool) -> BrowsingState:
         return replace(self, show_hidden_entries=show_hidden_entries)
+
+    def with_semantic(self, semantic: bool) -> BrowsingState:
+        return replace(self, semantic=semantic)

@@ -14,6 +14,7 @@ from os import makedirs
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import numpy as np
 import structlog
 from humanfriendly import format_timespan  # pyright: ignore[reportUnknownVariableType]
 from sqlalchemy import (
@@ -71,6 +72,12 @@ from tagstudio.core.library.alchemy.constants import (
     TAG_CHILDREN_QUERY,
 )
 from tagstudio.core.library.alchemy.db import Base as ModelBase
+from tagstudio.core.library.alchemy.embeddings import (
+    EmbeddingBackend,
+    EmbeddingConfig,
+    EntryEmbeddingRecord,
+    SemanticIndex,
+)
 from tagstudio.core.library.alchemy.enums import MAX_SQL_VARIABLES, BrowsingState, SortingModeEnum
 from tagstudio.core.library.alchemy.fields import (
     LEGACY_FIELD_MAP,
@@ -85,6 +92,7 @@ from tagstudio.core.library.alchemy.joins import CategoryExclusion, TagEntry, Ta
 from tagstudio.core.library.alchemy.migrations import DBMigrations, MigrationError
 from tagstudio.core.library.alchemy.models import (
     Entry,
+    EntryEmbedding,
     Namespace,
     Tag,
     TagAlias,
@@ -215,6 +223,7 @@ class Library:
         self.dupe_files_count: int = -1
         self.ignored_entries_count: int = -1
         self.unlinked_entries_count: int = -1
+        self.semantic_index: SemanticIndex | None = None
 
     def close(self):
         if self.engine:
@@ -222,6 +231,7 @@ class Library:
         self.library_dir = None
         self.folder = None
         self.included_files = set()
+        self.semantic_index = None
 
         self.dupe_entries_count = -1
         self.dupe_files_count = -1
@@ -697,8 +707,10 @@ class Library:
     @property
     def tags(self) -> list[Tag]:
         with Session(self.engine) as session:
-            # load all tags and join parent tags
-            tags_query = select(Tag).options(selectinload(Tag.parent_tags))
+            # load all tags and join parent tags/aliases
+            tags_query = select(Tag).options(
+                selectinload(Tag.parent_tags), selectinload(Tag.aliases)
+            )
             tags = session.scalars(tags_query).unique()
             tags_list = list(tags)
 
@@ -772,6 +784,144 @@ class Library:
             path_strings = list(map(lambda x: x.as_posix(), paths))
             return path_strings
 
+    def configure_semantic_index(
+        self,
+        config: EmbeddingConfig,
+        backend: EmbeddingBackend | None = None,
+    ) -> SemanticIndex:
+        """Enable semantic search and auto-tagging for this library."""
+        self.semantic_index = SemanticIndex(self, config, backend=backend)
+        return self.semantic_index
+
+    def get_entries_for_embedding(self, entry_ids: Iterable[int] | None = None) -> list[Entry]:
+        """Load entries with the tags and fields needed to build embeddings."""
+        if entry_ids is None:
+            return list(self.all_entries(with_joins=True))
+        unique_ids = list(dict.fromkeys(entry_ids))
+        if not unique_ids:
+            return []
+        return list(self.get_entries_full(unique_ids))
+
+    def get_entry_embedding_hashes(self, model: str, task: str, dimensions: int) -> dict[int, str]:
+        """Return ``entry_id -> content_hash`` for stored embeddings."""
+        with Session(self.engine) as session:
+            statement = select(EntryEmbedding.entry_id, EntryEmbedding.content_hash).where(
+                EntryEmbedding.model == model,
+                EntryEmbedding.task == task,
+                EntryEmbedding.dimensions == dimensions,
+            )
+            rows = session.execute(statement).all()
+            return {int(entry_id): str(content_hash) for entry_id, content_hash in rows}
+
+    def count_entry_embeddings(self, model: str, task: str, dimensions: int) -> int:
+        with Session(self.engine) as session:
+            statement = select(func.count(EntryEmbedding.entry_id)).where(
+                EntryEmbedding.model == model,
+                EntryEmbedding.task == task,
+                EntryEmbedding.dimensions == dimensions,
+            )
+            return int(session.scalar(statement) or 0)
+
+    def save_entry_embeddings(self, records: Iterable[EntryEmbeddingRecord]) -> None:
+        with Session(self.engine) as session:
+            for record in records:
+                session.merge(
+                    EntryEmbedding(
+                        entry_id=record.entry_id,
+                        model=record.model,
+                        task=record.task,
+                        dimensions=record.dimensions,
+                        vector=record.vector,
+                        content_hash=record.content_hash,
+                    )
+                )
+            session.commit()
+
+    def load_entry_embedding_records(
+        self,
+        entry_ids: Iterable[int],
+        model: str,
+        task: str,
+        dimensions: int,
+    ) -> dict[int, tuple[str, bytes]]:
+        """Return ``entry_id -> (content_hash, packed_vector)`` for the given entries."""
+        ids = list(dict.fromkeys(entry_ids))
+        results: dict[int, tuple[str, bytes]] = {}
+        if not ids:
+            return results
+
+        with Session(self.engine) as session:
+            chunk_size = max(1, MAX_SQL_VARIABLES - 8)
+            for start in range(0, len(ids), chunk_size):
+                chunk = ids[start : start + chunk_size]
+                statement = select(
+                    EntryEmbedding.entry_id,
+                    EntryEmbedding.content_hash,
+                    EntryEmbedding.vector,
+                ).where(
+                    EntryEmbedding.entry_id.in_(chunk),
+                    EntryEmbedding.model == model,
+                    EntryEmbedding.task == task,
+                    EntryEmbedding.dimensions == dimensions,
+                )
+                for entry_id, content_hash, vector in session.execute(statement):
+                    results[entry_id] = (content_hash, vector)
+        return results
+
+    def load_entry_embedding_vectors(
+        self,
+        model: str,
+        task: str,
+        dimensions: int,
+        *,
+        include_hidden: bool = False,
+    ) -> tuple[list[int], np.ndarray]:
+        """Load stored vectors as ``(entry_ids, matrix)`` for similarity search."""
+        with Session(self.engine) as session:
+            statement = select(EntryEmbedding.entry_id, EntryEmbedding.vector).where(
+                EntryEmbedding.model == model,
+                EntryEmbedding.task == task,
+                EntryEmbedding.dimensions == dimensions,
+            )
+            if not include_hidden:
+                hidden_tag_ids = select(Tag.id).where(Tag.is_hidden)
+                hidden_entry_ids = select(TagEntry.entry_id).where(
+                    TagEntry.tag_id.in_(hidden_tag_ids)
+                )
+                statement = statement.where(EntryEmbedding.entry_id.not_in(hidden_entry_ids))
+
+            ids: list[int] = []
+            vectors: list[np.ndarray] = []
+            for entry_id, packed in session.execute(statement):
+                vector = np.frombuffer(packed, dtype=np.float32)
+                if vector.size != dimensions:
+                    logger.warning(
+                        "[Library] Ignoring embedding with unexpected dimensions",
+                        entry_id=entry_id,
+                        expected=dimensions,
+                        actual=int(vector.size),
+                    )
+                    continue
+                ids.append(entry_id)
+                vectors.append(vector)
+
+        if not vectors:
+            return [], np.empty((0, dimensions), dtype=np.float32)
+        matrix = np.vstack(vectors).astype(np.float32, copy=False)
+        return ids, matrix
+
+    def clear_entry_embeddings(self, model: str | None = None) -> int:
+        """Delete stored embeddings, optionally only for one model."""
+        with Session(self.engine) as session:
+            statement = delete(EntryEmbedding)
+            if model is not None:
+                statement = statement.where(EntryEmbedding.model == model)
+            result = session.execute(statement)
+            session.commit()
+            count = int(getattr(result, "rowcount", 0) or 0)
+            logger.info("[Library] Cleared entry embeddings", count=count, model=model)
+            return count
+
     def search_library(
         self,
         search: BrowsingState,
@@ -783,6 +933,19 @@ class Library:
         """
         assert isinstance(search, BrowsingState)
         assert self.library_dir
+
+        # Semantic search bypasses the tag query language entirely.
+        if search.semantic and search.query and search.query.strip():
+            if not self.semantic_index:
+                return SearchResult(total_count=0, ids=[])
+            ranked_ids = self.semantic_index.search_entry_ids(
+                search.query, show_hidden=search.show_hidden_entries
+            )
+            total_count = len(ranked_ids)
+            if page_size:
+                start = search.page_index * page_size
+                ranked_ids = ranked_ids[start : start + page_size]
+            return SearchResult(total_count=total_count, ids=ranked_ids)
 
         with Session(unwrap(self.engine), expire_on_commit=False) as session:
             if page_size:
