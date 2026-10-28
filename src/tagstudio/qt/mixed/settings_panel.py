@@ -438,6 +438,48 @@ class SettingsPanel(ModalContent):
             self.auto_tag_hubness_checkbox,
         )
 
+        # Check suggestions against the image with a vision-language model
+        self.auto_tag_verify_checkbox = QCheckBox()
+        self.auto_tag_verify_checkbox.setChecked(self.driver.settings.auto_tag_verify_enabled)
+        self.auto_tag_verify_checkbox.setToolTip(
+            Translations["settings.embeddings.auto_tag_verify.tooltip"]
+        )
+        form_layout.addRow(
+            Translations["settings.embeddings.auto_tag_verify"],
+            self.auto_tag_verify_checkbox,
+        )
+
+        self.auto_tag_verify_url_edit = QLineEdit()
+        self.auto_tag_verify_url_edit.setText(self.driver.settings.auto_tag_verify_base_url)
+        self.auto_tag_verify_url_edit.setToolTip(
+            Translations["settings.embeddings.auto_tag_verify.base_url.tooltip"]
+        )
+        form_layout.addRow(
+            Translations["settings.embeddings.auto_tag_verify.base_url"],
+            self.auto_tag_verify_url_edit,
+        )
+
+        self.auto_tag_verify_model_edit = QLineEdit()
+        self.auto_tag_verify_model_edit.setText(self.driver.settings.auto_tag_verify_model)
+        self.auto_tag_verify_model_edit.setToolTip(
+            Translations["settings.embeddings.auto_tag_verify.model.tooltip"]
+        )
+        form_layout.addRow(
+            Translations["settings.embeddings.auto_tag_verify.model"],
+            self.auto_tag_verify_model_edit,
+        )
+
+        self.auto_tag_verify_key_edit = QLineEdit()
+        self.auto_tag_verify_key_edit.setText(self.driver.settings.auto_tag_verify_api_key)
+        self.auto_tag_verify_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.auto_tag_verify_key_edit.setToolTip(
+            Translations["settings.embeddings.auto_tag_verify.api_key.tooltip"]
+        )
+        form_layout.addRow(
+            Translations["settings.embeddings.auto_tag_verify.api_key"],
+            self.auto_tag_verify_key_edit,
+        )
+
         self.embeddings_option_widgets = [
             self.embeddings_model_line_edit,
             self.embeddings_dimensions_combobox,
@@ -447,12 +489,28 @@ class SettingsPanel(ModalContent):
             self.auto_tag_max_spinbox,
             self.auto_tag_one_per_facet_checkbox,
             self.auto_tag_hubness_checkbox,
+            self.auto_tag_verify_checkbox,
+        ]
+        self.auto_tag_verify_option_widgets = [
+            self.auto_tag_verify_url_edit,
+            self.auto_tag_verify_model_edit,
+            self.auto_tag_verify_key_edit,
         ]
         self.embeddings_enabled_checkbox.toggled.connect(self.__set_embeddings_options_enabled)
+        self.auto_tag_verify_checkbox.toggled.connect(self.__sync_verify_options)
         self.__set_embeddings_options_enabled(self.embeddings_enabled_checkbox.isChecked())
 
     def __set_embeddings_options_enabled(self, enabled: bool):
         for widget in self.embeddings_option_widgets:
+            widget.setEnabled(enabled)
+        self.__sync_verify_options()
+
+    def __sync_verify_options(self):
+        enabled = (
+            self.embeddings_enabled_checkbox.isChecked()
+            and self.auto_tag_verify_checkbox.isChecked()
+        )
+        for widget in self.auto_tag_verify_option_widgets:
             widget.setEnabled(enabled)
 
     def __build_localization_settings(self):
@@ -565,6 +623,10 @@ class SettingsPanel(ModalContent):
             "auto_tag_max_suggestions": self.auto_tag_max_spinbox.value(),
             "auto_tag_one_per_facet": self.auto_tag_one_per_facet_checkbox.isChecked(),
             "auto_tag_hubness": self.auto_tag_hubness_checkbox.isChecked(),
+            "auto_tag_verify_enabled": self.auto_tag_verify_checkbox.isChecked(),
+            "auto_tag_verify_base_url": self.auto_tag_verify_url_edit.text().strip(),
+            "auto_tag_verify_model": self.auto_tag_verify_model_edit.text().strip(),
+            "auto_tag_verify_api_key": self.auto_tag_verify_key_edit.text().strip(),
         }
 
     def update_settings(self, driver: QtDriver):
@@ -602,6 +664,10 @@ class SettingsPanel(ModalContent):
         driver.settings.auto_tag_max_suggestions = settings["auto_tag_max_suggestions"]
         driver.settings.auto_tag_one_per_facet = settings["auto_tag_one_per_facet"]
         driver.settings.auto_tag_hubness = settings["auto_tag_hubness"]
+        driver.settings.auto_tag_verify_enabled = settings["auto_tag_verify_enabled"]
+        driver.settings.auto_tag_verify_base_url = settings["auto_tag_verify_base_url"]
+        driver.settings.auto_tag_verify_model = settings["auto_tag_verify_model"]
+        driver.settings.auto_tag_verify_api_key = settings["auto_tag_verify_api_key"]
 
         driver.settings.save()
         driver.configure_embeddings()

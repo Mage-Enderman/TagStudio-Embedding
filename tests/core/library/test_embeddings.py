@@ -13,7 +13,9 @@ from tagstudio.core.library.alchemy.embeddings import (
     EmbeddingService,
     EmbeddingUnavailableError,
     _job_batches,
+    describe_title,
     entry_title,
+    normalize_terms,
     select_tag_suggestions,
     tag_hubness,
     tag_label,
@@ -23,6 +25,7 @@ from tagstudio.core.library.alchemy.enums import BrowsingState
 from tagstudio.core.library.alchemy.fields import TextField
 from tagstudio.core.library.alchemy.library import Library
 from tagstudio.core.library.alchemy.models import Entry, Tag
+from tagstudio.core.library.alchemy.tag_verifier import VerificationConfig, VerificationOutcome
 
 KEYWORDS = {
     "kitten": 0,
@@ -349,6 +352,157 @@ def test_suggest_tags_reports_files_without_suggestions(embedding_library: Libra
 
     assert result.suggestions == []
     assert [entry_id for entry_id, _name in result.unsuggested] == [3]
+
+
+def test_capture_noise_is_not_read_as_content():
+    """A render flag, a clock time and a resolution describe the capture, not the frame."""
+    title = describe_title(normalize_terms("VRChat_DLSS_2026-09-04_17-37-48.282_1280x720"))
+
+    assert title == "VRChat"
+    assert title_is_informative(title)
+
+
+def test_a_lone_number_stays_part_of_the_name():
+    assert describe_title(normalize_terms("2001_a_space_odyssey")) == "2001 a space odyssey"
+    assert describe_title(normalize_terms("boeing_747")) == "boeing 747"
+    # Two or more numbers in a row are a capture timestamp, not a name.
+    assert describe_title(normalize_terms("IMG_20241212_183835927")) == "IMG"
+
+
+def test_resolutions_and_pipeline_flags_alone_are_not_informative():
+    assert not title_is_informative("DLSS 1280x720")
+    assert not title_is_informative("1920x1080 60fps")
+
+
+class StubVerifier:
+    """Stands in for the vision-language check without any HTTP."""
+
+    def __init__(self, keep: set[int] | None, error: str = ""):
+        self.config = VerificationConfig(base_url="http://localhost:1234/v1", model="stub-vl")
+        self.keep = keep
+        self.error = error
+        self.calls: list[list[str]] = []
+
+    def verify(self, image_path, labels):
+        self.calls.append(list(labels))
+        kept = None if self.keep is None else frozenset(self.keep)
+        return VerificationOutcome(kept=kept, error=self.error)
+
+
+def _add_bar_kitten(embedding_library: Library) -> int:
+    entry = Entry(
+        id=4,
+        path=Path("bar_kitten.txt"),
+        fields=[TextField(name="Description", value="a bar kitten")],
+    )
+    assert embedding_library.add_entries([entry])
+    return 4
+
+
+def _pretend_files_have_images(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "tagstudio.core.library.alchemy.embeddings.media_path_for_entry",
+        lambda *args, **kwargs: Path("bar_kitten.png"),
+    )
+
+
+def test_suggest_tags_drops_every_tag_the_verifier_rejects(
+    embedding_library: Library, monkeypatch: pytest.MonkeyPatch
+):
+    index = embedding_library.semantic_index
+    assert index is not None
+    entry_id = _add_bar_kitten(embedding_library)
+    _pretend_files_have_images(monkeypatch)
+
+    baseline = index.suggest_tags([entry_id], threshold=0.5, max_per_entry=5)
+    assert baseline.suggestions
+    assert baseline.verified == 0
+
+    verifier = StubVerifier(keep=set())
+    result = index.suggest_tags([entry_id], threshold=0.5, max_per_entry=5, verifier=verifier)
+
+    assert verifier.calls == [[suggestion.tag_name for suggestion in baseline.suggestions]]
+    assert result.suggestions == []
+    assert result.verified == 1
+    assert result.dropped == len(baseline.suggestions)
+    assert [unsuggested_id for unsuggested_id, _name in result.unsuggested] == [entry_id]
+
+    # What the model was asked is kept so the modal can show it for debugging.
+    assert len(result.verify_notes) == 1
+    note = result.verify_notes[0]
+    assert note.entry_name == "bar_kitten.txt"
+    assert list(note.labels) == verifier.calls[0]
+    assert note.kept == 0
+
+
+def test_suggest_tags_keeps_only_accepted_tags(
+    embedding_library: Library, monkeypatch: pytest.MonkeyPatch
+):
+    index = embedding_library.semantic_index
+    assert index is not None
+    entry_id = _add_bar_kitten(embedding_library)
+    _pretend_files_have_images(monkeypatch)
+
+    verifier = StubVerifier(keep={0})
+    result = index.suggest_tags([entry_id], threshold=0.5, max_per_entry=5, verifier=verifier)
+
+    offered = verifier.calls[0]
+    assert [suggestion.tag_name for suggestion in result.suggestions] == [offered[0]]
+    assert result.dropped == len(offered) - 1
+    assert result.verify_model == "stub-vl"
+
+
+def test_suggest_tags_keeps_suggestions_when_verification_fails(
+    embedding_library: Library, monkeypatch: pytest.MonkeyPatch
+):
+    """A failed request must never look like the model rejecting every tag."""
+    index = embedding_library.semantic_index
+    assert index is not None
+    entry_id = _add_bar_kitten(embedding_library)
+    _pretend_files_have_images(monkeypatch)
+
+    baseline = index.suggest_tags([entry_id], threshold=0.5, max_per_entry=5)
+    verifier = StubVerifier(keep=None, error="connection refused")
+    result = index.suggest_tags([entry_id], threshold=0.5, max_per_entry=5, verifier=verifier)
+
+    assert [suggestion.tag_id for suggestion in result.suggestions] == [
+        suggestion.tag_id for suggestion in baseline.suggestions
+    ]
+    assert result.verified == 0
+    assert result.unverified == 1
+    assert "connection refused" in result.verify_error
+
+
+def test_suggest_tags_does_not_verify_files_without_an_image(embedding_library: Library):
+    index = embedding_library.semantic_index
+    assert index is not None
+    entry_id = _add_bar_kitten(embedding_library)
+
+    verifier = StubVerifier(keep=set())
+    result = index.suggest_tags([entry_id], threshold=0.5, max_per_entry=5, verifier=verifier)
+
+    assert verifier.calls == []
+    assert result.unverified == 1
+    assert result.suggestions
+
+
+def test_suggest_tags_announces_the_verifying_stage(
+    embedding_library: Library, monkeypatch: pytest.MonkeyPatch
+):
+    index = embedding_library.semantic_index
+    assert index is not None
+    entry_id = _add_bar_kitten(embedding_library)
+    _pretend_files_have_images(monkeypatch)
+    stages: list[str] = []
+
+    index.suggest_tags(
+        [entry_id],
+        threshold=0.5,
+        verifier=StubVerifier(keep={0}),
+        stage=stages.append,
+    )
+
+    assert stages == ["verifying"]
 
 
 def test_clear_entry_embeddings(embedding_library: Library):

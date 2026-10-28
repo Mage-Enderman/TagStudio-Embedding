@@ -8,7 +8,12 @@ from unittest.mock import Mock
 from PySide6.QtCore import Qt
 from pytestqt.qtbot import QtBot
 
-from tagstudio.core.library.alchemy.embeddings import AutoTagResult, AutoTagSuggestion
+from tagstudio.core.library.alchemy.embeddings import (
+    AutoTagResult,
+    AutoTagSuggestion,
+    TagVerificationNote,
+)
+from tagstudio.i18n.translations import Translations
 from tagstudio.qt.mixed.auto_tag_modal import (
     ENTRY_ROLE,
     ENTRY_ROW,
@@ -126,6 +131,125 @@ def test_apply_only_sends_checked_tags(qtbot: QtBot, qt_driver: QtDriver):
     modal._on_apply()
 
     assert sorted(applied) == [(1, 10), (1, 11), (2, 10)]
+
+
+def test_verification_summary_is_hidden_without_a_verifier(qtbot: QtBot, qt_driver: QtDriver):
+    modal = _build_modal(qtbot, qt_driver)
+
+    modal._on_finished(_result())
+
+    assert modal.verify_label.isHidden()
+
+
+def test_verification_summary_reports_kept_dropped_and_unchecked(qtbot: QtBot, qt_driver: QtDriver):
+    modal = _build_modal(qtbot, qt_driver)
+    result = AutoTagResult(
+        suggestions=[_suggestion(1, "CAT.png", 10, "Cat", 0.81)],
+        verified=1,
+        unverified=2,
+        dropped=3,
+        verify_model="lfm3-vl-2b",
+    )
+
+    modal._on_finished(result)
+
+    assert not modal.verify_label.isHidden()
+    text = modal.verify_label.text()
+    assert "lfm3-vl-2b" in text
+    assert "3 dropped" in text
+    assert "2 file(s) left unchecked" in text
+
+
+def test_verification_summary_shows_a_failure(qtbot: QtBot, qt_driver: QtDriver):
+    """Suggestions that were not checked must not look like they passed."""
+    modal = _build_modal(qtbot, qt_driver)
+    result = AutoTagResult(
+        suggestions=[_suggestion(1, "CAT.png", 10, "Cat", 0.81)],
+        unverified=1,
+        verify_model="lfm3-vl-2b",
+        verify_error="Connection refused",
+    )
+
+    modal._on_finished(result)
+
+    assert "Connection refused" in modal.verify_label.text()
+
+
+def test_verification_details_show_the_raw_reply(qtbot: QtBot, qt_driver: QtDriver):
+    """A strange result must be inspectable, not just reported as a failure."""
+    modal = _build_modal(qtbot, qt_driver)
+    result = AutoTagResult(
+        suggestions=[_suggestion(1, "RUNNER.png", 10, "Ass", 0.78)],
+        verified=1,
+        verify_model="lfm3-vl-2b",
+        verify_notes=[
+            TagVerificationNote(
+                entry_name="RUNNER.png",
+                labels=("NSFW", "Ass"),
+                reply="NSFW, Ass",
+                kept=2,
+            ),
+            TagVerificationNote(
+                entry_name="BROKEN.png",
+                labels=("Cat",),
+                error="The model returned an empty reply.",
+            ),
+        ],
+    )
+
+    modal._on_finished(result)
+
+    assert not modal.verify_details_button.isHidden()
+    # Collapsed until asked for, so the dialog stays about the tags.
+    assert modal.verify_details_view.isHidden()
+
+    text = modal.verify_details_view.toPlainText()
+    assert "RUNNER.png" in text
+    assert "asked: NSFW, Ass" in text
+    assert "reply: NSFW, Ass" in text
+    assert "kept 2 of 2" in text
+    assert "not checked: The model returned an empty reply." in text
+
+
+def test_verification_details_toggle_shows_the_reply(qtbot: QtBot, qt_driver: QtDriver):
+    modal = _build_modal(qtbot, qt_driver)
+    result = AutoTagResult(
+        verify_model="lfm3-vl-2b",
+        suggestions=[_suggestion(1, "CAT.png", 10, "Cat", 0.81)],
+        verify_notes=[TagVerificationNote(entry_name="CAT.png", labels=("Cat",), reply="Cat")],
+    )
+    modal._on_finished(result)
+
+    modal.verify_details_button.click()
+    assert not modal.verify_details_view.isHidden()
+
+    modal.verify_details_button.click()
+    assert modal.verify_details_view.isHidden()
+
+
+def test_verification_failure_opens_the_details(qtbot: QtBot, qt_driver: QtDriver):
+    """When the check breaks, the raw reply is the first thing worth reading."""
+    modal = _build_modal(qtbot, qt_driver)
+    result = AutoTagResult(
+        suggestions=[_suggestion(1, "CAT.png", 10, "Cat", 0.81)],
+        unverified=1,
+        verify_model="lfm3-vl-2b",
+        verify_error="The model returned an empty reply.",
+        verify_notes=[TagVerificationNote(entry_name="CAT.png", labels=("Cat",))],
+    )
+
+    modal._on_finished(result)
+
+    assert modal.verify_details_button.isChecked()
+    assert not modal.verify_details_view.isHidden()
+
+
+def test_verifying_stage_is_reported(qtbot: QtBot, qt_driver: QtDriver):
+    modal = _build_modal(qtbot, qt_driver)
+
+    modal._on_stage("verifying")
+
+    assert modal.status_label.text() == Translations["auto_tag.verify.stage"]
 
 
 def test_filter_keeps_matching_files_and_tags_visible(qtbot: QtBot, qt_driver: QtDriver):

@@ -7,6 +7,25 @@ from pathlib import Path
 from tagstudio.qt.app_settings import AppSettings, Theme
 
 
+def test_vision_verifier_settings_are_off_by_default_and_round_trip(library_dir: Path):
+    settings = AppSettings()
+    assert settings.auto_tag_verify_enabled is False
+    assert settings.auto_tag_verify_model == ""
+
+    settings.auto_tag_verify_enabled = True
+    settings.auto_tag_verify_base_url = "http://localhost:11434/v1"
+    settings.auto_tag_verify_model = "lfm3-vl-2b"
+    settings.auto_tag_verify_api_key = "token"
+    path = library_dir / "verify_settings.toml"
+    settings.save(path)
+
+    reloaded = AppSettings.read_settings(path)
+    assert reloaded.auto_tag_verify_enabled is True
+    assert reloaded.auto_tag_verify_base_url == "http://localhost:11434/v1"
+    assert reloaded.auto_tag_verify_model == "lfm3-vl-2b"
+    assert reloaded.auto_tag_verify_api_key == "token"
+
+
 def test_read_settings(library_dir: Path):
     settings_path = library_dir / "settings.toml"
     with open(settings_path, "w") as settings_file:

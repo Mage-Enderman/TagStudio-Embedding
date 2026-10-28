@@ -29,6 +29,7 @@ from tagstudio.core.library.alchemy.models import Entry, Tag
 
 if TYPE_CHECKING:
     from tagstudio.core.library.alchemy.library import Library
+    from tagstudio.core.library.alchemy.tag_verifier import TagVerifier
 
 
 logger = structlog.get_logger(__name__)
@@ -149,6 +150,14 @@ _NOISE_WORDS = frozenset(
     }
 )
 
+# Tokens that describe how a file was captured rather than what it shows:
+# "VRChat_DLSS_2026-09-04_17-37-48.282_1280x720" is a game screenshot, and none of
+# the pipeline flags, the clock time or the resolution say anything about the frame.
+_CAPTURE_WORDS = frozenset({"dlss", "fhd", "fps", "fsr", "hdr", "qhd", "taa", "uhd", "xess"})
+_RESOLUTION_RE = re.compile(r"^\d{2,5}[x×]\d{2,5}$")
+_RESOLUTION_SUFFIX_RE = re.compile(r"^\d{3,4}[pk]$")
+_NUMBER_RE = re.compile(r"^\d+(?:\.\d+)?$")
+
 # Hubness correction. A tag that is close to *everything* (NSFW tag names, very broad
 # categories) scores above the threshold for every file while saying nothing about any
 # of them. Measuring how close each tag generally is to the library's files lets that
@@ -161,6 +170,7 @@ EntryEmbeddingInput = str | dict[str, Any]
 EntryJob = tuple[Entry, EntryEmbeddingInput, str]
 ProgressCallback = Callable[[int, int, str], None]
 CancelCallback = Callable[[], bool]
+StageCallback = Callable[[str], None]
 
 
 class EmbeddingUnavailableError(RuntimeError):
@@ -215,16 +225,43 @@ class AutoTagSuggestion:
 
 
 @dataclass(frozen=True)
+class TagVerificationNote:
+    """What the vision model was asked about one file, and what it answered.
+
+    Kept for every file the check looked at so the auto-tag modal can show the exact
+    reply. ``kept`` is ``None`` when the file could not be checked, which is also
+    when ``error`` says why.
+    """
+
+    entry_name: str
+    labels: tuple[str, ...]
+    reply: str = ""
+    error: str = ""
+    kept: int | None = None
+
+
+@dataclass(frozen=True)
 class AutoTagResult:
     """Suggestions for a run, plus the ``(entry_id, name)`` files left without any.
 
     A file ends up in ``unsuggested`` when nothing readable could be embedded or
     when no tag stood out for it, so the UI can say so instead of silently
     dropping it from the list.
+
+    The verification counts describe the optional vision-language check: ``verified``
+    files had their suggestions filtered by the model, ``unverified`` files were left
+    alone (no image, no endpoint, or an answer that could not be read), and
+    ``dropped`` counts the suggestions the model rejected.
     """
 
     suggestions: list[AutoTagSuggestion] = field(default_factory=list)
     unsuggested: list[tuple[int, str]] = field(default_factory=list)
+    verified: int = 0
+    unverified: int = 0
+    dropped: int = 0
+    verify_model: str = ""
+    verify_error: str = ""
+    verify_notes: list[TagVerificationNote] = field(default_factory=list)
 
 
 def embedding_dependency_hint() -> str:
@@ -400,6 +437,30 @@ def normalize_terms(text: str) -> str:
     return " ".join(text.replace("_", " ").replace("-", " ").split())
 
 
+def describe_title(title: str) -> str:
+    """Remove capture noise from a file title, keeping any describing words.
+
+    A lone number is usually part of the name (``boeing 747``, ``2001 a space
+    odyssey``) and is kept; a run of them is a capture timestamp and says nothing.
+    """
+    words = title.split()
+    numeric = [word for word in words if _NUMBER_RE.fullmatch(word)]
+    keep_numbers = len(numeric) <= 1
+
+    kept: list[str] = []
+    for word in words:
+        if (
+            _RESOLUTION_RE.fullmatch(word)
+            or _RESOLUTION_SUFFIX_RE.fullmatch(word)
+            or word.lower() in _CAPTURE_WORDS
+        ):
+            continue
+        if not keep_numbers and _NUMBER_RE.fullmatch(word):
+            continue
+        kept.append(word)
+    return " ".join(kept)
+
+
 def title_is_informative(title: str) -> bool:
     """Return whether a filename says anything about the file's content.
 
@@ -408,7 +469,11 @@ def title_is_informative(title: str) -> bool:
     such file look the same to the model, which is why a single set of unrelated
     tags kept being suggested for whole batches of files.
     """
-    words = [word for word in re.findall(r"[a-z]+", title.lower()) if word not in _NOISE_WORDS]
+    words = [
+        word
+        for word in re.findall(r"[a-z]+", describe_title(title).lower())
+        if word not in _NOISE_WORDS and word not in _CAPTURE_WORDS
+    ]
     return any(len(word) > 1 for word in words)
 
 
@@ -423,7 +488,7 @@ def entry_kind_label(path: Path) -> str:
 
 
 def entry_title(entry: Entry) -> str:
-    title = normalize_terms(entry.path.stem) or entry.path.name
+    title = describe_title(normalize_terms(entry.path.stem))
     if title_is_informative(title):
         return title
     return entry_kind_label(entry.path)
@@ -1039,6 +1104,8 @@ class SemanticIndex:
         max_per_entry: int = 5,
         one_per_facet: bool = True,
         use_hubness: bool = True,
+        verifier: TagVerifier | None = None,
+        stage: StageCallback | None = None,
         progress: ProgressCallback | None = None,
         should_cancel: CancelCallback | None = None,
     ) -> AutoTagResult:
@@ -1047,6 +1114,11 @@ class SemanticIndex:
         Files with nothing to look at — an unreadable video with a camera-generated
         name — are reported in :attr:`AutoTagResult.unsuggested` instead of being
         given tags chosen from noise.
+
+        When a ``verifier`` is given, its model is shown each file's image together
+        with the suggestions that survived ranking, and may reject any of them. A
+        file the verifier could not check keeps every suggestion: a failed request
+        must never look like a rejection.
         """
         if not entry_ids:
             return AutoTagResult()
@@ -1067,6 +1139,17 @@ class SemanticIndex:
 
         suggestions: list[AutoTagSuggestion] = []
         unsuggested: list[tuple[int, str]] = []
+        verified = 0
+        unverified = 0
+        dropped = 0
+        verify_error = ""
+        verify_notes: list[TagVerificationNote] = []
+        verify_model = verifier.config.model if verifier is not None else ""
+        verifying = verifier is not None and verifier.config.is_configured
+        if verifying and stage is not None:
+            # Everything is embedded by now, so tell the UI why the next calls are slow.
+            stage("verifying")
+
         for entry in entries:
             if should_cancel and should_cancel():
                 break
@@ -1101,6 +1184,46 @@ class SemanticIndex:
                 unsuggested.append((entry.id, entry.path.name))
                 continue
 
+            if verifying and verifier is not None:
+                image_path = media_path_for_entry(
+                    entry, self.library.library_dir, self._frame_cache_dir()
+                )
+                labels = tuple(tag.name for tag, _score in selected)
+                if image_path is None:
+                    unverified += 1
+                    verify_notes.append(
+                        TagVerificationNote(
+                            entry_name=entry.path.name,
+                            labels=labels,
+                            error="No image could be read out of this file.",
+                        )
+                    )
+                else:
+                    outcome = verifier.verify(image_path, labels)
+                    verify_notes.append(
+                        TagVerificationNote(
+                            entry_name=entry.path.name,
+                            labels=labels,
+                            reply=outcome.reply,
+                            error=outcome.error,
+                            kept=None if outcome.kept is None else len(outcome.kept),
+                        )
+                    )
+                    if outcome.kept is None:
+                        unverified += 1
+                        verify_error = verify_error or outcome.error
+                    else:
+                        verified += 1
+                        kept = [
+                            pair for index, pair in enumerate(selected) if index in outcome.kept
+                        ]
+                        dropped += len(selected) - len(kept)
+                        selected = kept
+
+            if not selected:
+                unsuggested.append((entry.id, entry.path.name))
+                continue
+
             for tag, score in selected:
                 suggestions.append(
                     AutoTagSuggestion(
@@ -1113,7 +1236,16 @@ class SemanticIndex:
                 )
 
         suggestions.sort(key=lambda item: (item.entry_name.lower(), -item.score))
-        return AutoTagResult(suggestions=suggestions, unsuggested=unsuggested)
+        return AutoTagResult(
+            suggestions=suggestions,
+            unsuggested=unsuggested,
+            verified=verified,
+            unverified=unverified,
+            dropped=dropped,
+            verify_model=verify_model if verified or unverified else "",
+            verify_error=verify_error,
+            verify_notes=verify_notes,
+        )
 
     def _record(
         self,

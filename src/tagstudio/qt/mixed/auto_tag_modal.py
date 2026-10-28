@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QLabel,
     QLineEdit,
+    QPlainTextEdit,
     QProgressBar,
     QPushButton,
     QTreeWidget,
@@ -26,11 +27,13 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from tagstudio.core.library.alchemy.tag_verifier import TagVerifier, VerificationConfig
 from tagstudio.i18n.translations import Translations
 from tagstudio.qt.utils.custom_runnable import CustomRunnable
 
 if TYPE_CHECKING:
     from tagstudio.core.library.alchemy.embeddings import AutoTagResult, SemanticIndex
+    from tagstudio.qt.app_settings import AppSettings
     from tagstudio.qt.qt_driver import QtDriver
 
 logger = structlog.get_logger(__name__)
@@ -61,6 +64,7 @@ class TagSuggestionTask(QObject):
         max_per_entry: int,
         one_per_facet: bool,
         use_hubness: bool,
+        verifier: TagVerifier | None = None,
     ) -> None:
         super().__init__()
         self.index = index
@@ -69,6 +73,7 @@ class TagSuggestionTask(QObject):
         self.max_per_entry = max_per_entry
         self.one_per_facet = one_per_facet
         self.use_hubness = use_hubness
+        self.verifier = verifier
         self._cancelled = threading.Event()
 
     def cancel(self) -> None:
@@ -87,6 +92,8 @@ class TagSuggestionTask(QObject):
                 max_per_entry=self.max_per_entry,
                 one_per_facet=self.one_per_facet,
                 use_hubness=self.use_hubness,
+                verifier=self.verifier,
+                stage=self.stage.emit,
                 progress=self._on_progress,
                 should_cancel=self._cancelled.is_set,
             )
@@ -136,6 +143,27 @@ class AutoTagModal(QWidget):
 
         self.status_label = QLabel(Translations["auto_tag.computing"])
         self.status_label.setWordWrap(True)
+
+        # Result of the optional vision-language check, hidden until it runs.
+        self.verify_label = QLabel()
+        self.verify_label.setWordWrap(True)
+        self.verify_label.setHidden(True)
+
+        # What the model was asked and what it actually answered. Hidden behind a
+        # toggle, but the only way to tell a picky model from a broken one.
+        self.verify_details_button = QPushButton(Translations["auto_tag.verify.details"])
+        self.verify_details_button.setCheckable(True)
+        self.verify_details_button.setHidden(True)
+        self.verify_details_button.toggled.connect(self._on_verify_details_toggled)
+
+        self.verify_details_view = QPlainTextEdit()
+        self.verify_details_view.setReadOnly(True)
+        self.verify_details_view.setHidden(True)
+        self.verify_details_view.setMaximumHeight(150)
+        self.verify_details_view.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        details_font = self.verify_details_view.font()
+        details_font.setFamilies(["Consolas", "Menlo", "DejaVu Sans Mono", "monospace"])
+        self.verify_details_view.setFont(details_font)
 
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 0)
@@ -193,6 +221,9 @@ class AutoTagModal(QWidget):
 
         self.root_layout.addWidget(self.description_label)
         self.root_layout.addWidget(self.status_label)
+        self.root_layout.addWidget(self.verify_label)
+        self.root_layout.addWidget(self.verify_details_button, 0, Qt.AlignmentFlag.AlignLeft)
+        self.root_layout.addWidget(self.verify_details_view)
         self.root_layout.addWidget(self.progress_bar)
         self.root_layout.addWidget(self.filter_edit)
         self.root_layout.addWidget(self.tree, 1)
@@ -212,6 +243,7 @@ class AutoTagModal(QWidget):
             max_per_entry=settings.auto_tag_max_suggestions,
             one_per_facet=settings.auto_tag_one_per_facet,
             use_hubness=settings.auto_tag_hubness,
+            verifier=self._build_verifier(settings),
         )
         self._task.progress.connect(self._on_progress)
         self._task.stage.connect(self._on_stage)
@@ -220,9 +252,31 @@ class AutoTagModal(QWidget):
         self._runnable = CustomRunnable(self._task.run)
         QThreadPool.globalInstance().start(self._runnable)
 
+    def _build_verifier(self, settings: AppSettings) -> TagVerifier | None:
+        """Return a verifier when one is switched on and fully configured."""
+        if not settings.auto_tag_verify_enabled:
+            return None
+
+        config = VerificationConfig(
+            base_url=settings.auto_tag_verify_base_url,
+            model=settings.auto_tag_verify_model,
+            api_key=settings.auto_tag_verify_api_key,
+        )
+        if not config.is_configured:
+            # Switched on but unusable: say so rather than running unchecked and
+            # letting it look like the check passed.
+            self.verify_label.setText(Translations["auto_tag.verify.unconfigured"])
+            self.verify_label.setHidden(False)
+            return None
+
+        self.verify_label.setHidden(True)
+        return TagVerifier(config)
+
     def _on_stage(self, stage: str) -> None:
         if stage == "loading_model":
             self.status_label.setText(Translations["auto_tag.loading_model"])
+        elif stage == "verifying":
+            self.status_label.setText(Translations["auto_tag.verify.stage"])
         else:
             self.status_label.setText(Translations["auto_tag.computing"])
 
@@ -282,6 +336,56 @@ class AutoTagModal(QWidget):
         self.select_all_button.setEnabled(has_tags)
         self.select_none_button.setEnabled(has_tags)
         self.apply_button.setEnabled(has_tags)
+
+        self._show_verification(result)
+
+    def _show_verification(self, result: AutoTagResult) -> None:
+        """Report what the vision check kept, dropped, and could not check."""
+        if not result.verify_model:
+            return
+
+        text = Translations.format(
+            "auto_tag.verify.summary",
+            model=result.verify_model,
+            kept=len(result.suggestions),
+            dropped=result.dropped,
+            unchecked=result.unverified,
+        )
+        if result.verify_error:
+            failure = Translations.format("auto_tag.verify.error", error=result.verify_error)
+            text = f"{text}\n{failure}"
+        self.verify_label.setText(text)
+        self.verify_label.setHidden(False)
+
+        self.verify_details_view.setPlainText(self._format_verify_details(result))
+        self.verify_details_button.setHidden(not result.verify_notes)
+        # A failure is exactly when the raw reply matters, so open the details.
+        if result.verify_error:
+            self.verify_details_button.setChecked(True)
+
+    def _format_verify_details(self, result: AutoTagResult) -> str:
+        """Lay out what each file was asked about and what the model answered."""
+        asked = Translations["auto_tag.verify.details.asked"]
+        reply = Translations["auto_tag.verify.details.reply"]
+        unchecked = Translations["auto_tag.verify.details.unchecked"]
+        kept = Translations["auto_tag.verify.details.kept"]
+
+        blocks: list[str] = []
+        for note in result.verify_notes:
+            lines = [note.entry_name, f"  {asked}: {', '.join(note.labels)}"]
+            if note.reply:
+                lines.append(f"  {reply}: {note.reply}")
+            if note.kept is None:
+                lines.append(f"  {Translations.format(unchecked, error=note.error or '-')}")
+            else:
+                lines.append(
+                    f"  {Translations.format(kept, kept=note.kept, sent=len(note.labels))}"
+                )
+            blocks.append("\n".join(lines))
+        return "\n\n".join(blocks)
+
+    def _on_verify_details_toggled(self, checked: bool) -> None:
+        self.verify_details_view.setVisible(checked)
 
     def _add_entry_item(self, entry_id: int, name: str, suggestions: list) -> None:
         parent = QTreeWidgetItem(self.tree)

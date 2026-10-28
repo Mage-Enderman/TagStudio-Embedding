@@ -88,6 +88,13 @@ class AppSettings(BaseModel):
     auto_tag_one_per_facet: bool = Field(default=True)
     auto_tag_hubness: bool = Field(default=True)
 
+    # Optional vision-language check of auto-tag suggestions, over an
+    # OpenAI-compatible API (LM Studio, Ollama, llama-server, vLLM, hosted).
+    auto_tag_verify_enabled: bool = Field(default=False)
+    auto_tag_verify_base_url: str = Field(default="http://localhost:1234/v1")
+    auto_tag_verify_model: str = Field(default="")
+    auto_tag_verify_api_key: str = Field(default="")
+
     date_format: str = Field(default="%x")
     hour_format: bool = Field(default=True)
     zero_padding: bool = Field(default=True)
