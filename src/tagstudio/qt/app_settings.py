@@ -85,6 +85,8 @@ class AppSettings(BaseModel):
     embeddings_use_images: bool = Field(default=True)
     auto_tag_threshold: float = Field(default=0.6)
     auto_tag_max_suggestions: int = Field(default=5)
+    auto_tag_one_per_facet: bool = Field(default=True)
+    auto_tag_hubness: bool = Field(default=True)
 
     date_format: str = Field(default="%x")
     hour_format: bool = Field(default=True)

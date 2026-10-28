@@ -419,6 +419,25 @@ class SettingsPanel(ModalContent):
             Translations["settings.embeddings.auto_tag_max"], self.auto_tag_max_spinbox
         )
 
+        # Only suggest one tag per parent category
+        self.auto_tag_one_per_facet_checkbox = QCheckBox()
+        self.auto_tag_one_per_facet_checkbox.setChecked(self.driver.settings.auto_tag_one_per_facet)
+        form_layout.addRow(
+            Translations["settings.embeddings.auto_tag_one_per_facet"],
+            self.auto_tag_one_per_facet_checkbox,
+        )
+
+        # Ignore tags that are similar to everything in the library
+        self.auto_tag_hubness_checkbox = QCheckBox()
+        self.auto_tag_hubness_checkbox.setChecked(self.driver.settings.auto_tag_hubness)
+        self.auto_tag_hubness_checkbox.setToolTip(
+            Translations["settings.embeddings.auto_tag_hubness.tooltip"]
+        )
+        form_layout.addRow(
+            Translations["settings.embeddings.auto_tag_hubness"],
+            self.auto_tag_hubness_checkbox,
+        )
+
         self.embeddings_option_widgets = [
             self.embeddings_model_line_edit,
             self.embeddings_dimensions_combobox,
@@ -426,6 +445,8 @@ class SettingsPanel(ModalContent):
             self.embeddings_use_images_checkbox,
             self.auto_tag_threshold_spinbox,
             self.auto_tag_max_spinbox,
+            self.auto_tag_one_per_facet_checkbox,
+            self.auto_tag_hubness_checkbox,
         ]
         self.embeddings_enabled_checkbox.toggled.connect(self.__set_embeddings_options_enabled)
         self.__set_embeddings_options_enabled(self.embeddings_enabled_checkbox.isChecked())
@@ -542,6 +563,8 @@ class SettingsPanel(ModalContent):
             "embeddings_use_images": self.embeddings_use_images_checkbox.isChecked(),
             "auto_tag_threshold": self.auto_tag_threshold_spinbox.value(),
             "auto_tag_max_suggestions": self.auto_tag_max_spinbox.value(),
+            "auto_tag_one_per_facet": self.auto_tag_one_per_facet_checkbox.isChecked(),
+            "auto_tag_hubness": self.auto_tag_hubness_checkbox.isChecked(),
         }
 
     def update_settings(self, driver: QtDriver):
@@ -577,6 +600,8 @@ class SettingsPanel(ModalContent):
         driver.settings.embeddings_use_images = settings["embeddings_use_images"]
         driver.settings.auto_tag_threshold = settings["auto_tag_threshold"]
         driver.settings.auto_tag_max_suggestions = settings["auto_tag_max_suggestions"]
+        driver.settings.auto_tag_one_per_facet = settings["auto_tag_one_per_facet"]
+        driver.settings.auto_tag_hubness = settings["auto_tag_hubness"]
 
         driver.settings.save()
         driver.configure_embeddings()

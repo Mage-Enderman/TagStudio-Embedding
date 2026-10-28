@@ -13,17 +13,18 @@ Install the optional dependencies with::
 from __future__ import annotations
 
 import hashlib
+import re
 import sys
 import threading
-from collections.abc import Callable, Iterable, Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
 import numpy as np
 import structlog
 
-from tagstudio.core.constants import RESERVED_TAG_END
+from tagstudio.core.constants import RESERVED_TAG_END, TS_FOLDER_NAME
 from tagstudio.core.library.alchemy.models import Entry, Tag
 
 if TYPE_CHECKING:
@@ -65,6 +66,96 @@ IMAGE_EXTENSIONS = frozenset(
         ".webp",
     }
 )
+
+# Video containers a preview frame can be decoded from (OpenCV with FFmpeg).
+VIDEO_EXTENSIONS = frozenset(
+    {
+        ".3gp",
+        ".avi",
+        ".flv",
+        ".gifv",
+        ".hevc",
+        ".m4p",
+        ".m4v",
+        ".mkv",
+        ".mov",
+        ".mp4",
+        ".webm",
+        ".wmv",
+    }
+)
+
+# Extracted video frames are cached inside the library so they are only decoded once.
+FRAME_CACHE_FOLDER_NAME = "embedding_frames"
+FRAME_LONGEST_SIDE = 512
+
+# Filename words that describe the file itself rather than what it shows. Camera and
+# phone exporters generate names built only from these plus digits, which say nothing
+# about the content and make every such file look identical to the model.
+_NOISE_WORDS = frozenset(
+    {
+        "clip",
+        "copy",
+        "dji",
+        "dsc",
+        "dscf",
+        "dscn",
+        "dscq",
+        "edit",
+        "export",
+        "file",
+        "final",
+        "frame",
+        "gop",
+        "gopr",
+        "gx",
+        "image",
+        "img",
+        "movie",
+        "mp4",
+        "mvi",
+        "new",
+        "photo",
+        "pic",
+        "picture",
+        "pxl",
+        "recording",
+        "render",
+        "screen",
+        "screenshot",
+        "shot",
+        "untitled",
+        "vid",
+        "video",
+        "videos",
+        "whatsapp",
+        # Glue words that never describe content on their own. "WhatsApp Video 2024-12-12
+        # at 18.35.92" is only noise plus "at", and must not count as a description.
+        "a",
+        "an",
+        "and",
+        "as",
+        "at",
+        "by",
+        "for",
+        "from",
+        "in",
+        "of",
+        "on",
+        "or",
+        "the",
+        "to",
+        "with",
+    }
+)
+
+# Hubness correction. A tag that is close to *everything* (NSFW tag names, very broad
+# categories) scores above the threshold for every file while saying nothing about any
+# of them. Measuring how close each tag generally is to the library's files lets that
+# popularity be subtracted: only tags this file is more similar to than usual survive.
+HUB_SAMPLE_LIMIT = 512
+HUB_NEIGHBOURS = 20
+HUB_MIN_SAMPLE = 8
 
 EntryEmbeddingInput = str | dict[str, Any]
 EntryJob = tuple[Entry, EntryEmbeddingInput, str]
@@ -121,6 +212,19 @@ class AutoTagSuggestion:
     tag_id: int
     tag_name: str
     score: float
+
+
+@dataclass(frozen=True)
+class AutoTagResult:
+    """Suggestions for a run, plus the ``(entry_id, name)`` files left without any.
+
+    A file ends up in ``unsuggested`` when nothing readable could be embedded or
+    when no tag stood out for it, so the UI can say so instead of silently
+    dropping it from the list.
+    """
+
+    suggestions: list[AutoTagSuggestion] = field(default_factory=list)
+    unsuggested: list[tuple[int, str]] = field(default_factory=list)
 
 
 def embedding_dependency_hint() -> str:
@@ -296,25 +400,55 @@ def normalize_terms(text: str) -> str:
     return " ".join(text.replace("_", " ").replace("-", " ").split())
 
 
+def title_is_informative(title: str) -> bool:
+    """Return whether a filename says anything about the file's content.
+
+    ``PXL_20241212_183835927``, ``IMG_1234`` and ``DSC_0001`` are camera-generated
+    and carry no description. Embedding them as if they were content makes every
+    such file look the same to the model, which is why a single set of unrelated
+    tags kept being suggested for whole batches of files.
+    """
+    words = [word for word in re.findall(r"[a-z]+", title.lower()) if word not in _NOISE_WORDS]
+    return any(len(word) > 1 for word in words)
+
+
+def entry_kind_label(path: Path) -> str:
+    """Describe a file by type, used when its name carries no description."""
+    ext = path.suffix.lower()
+    if ext in VIDEO_EXTENSIONS:
+        return "video"
+    if ext in IMAGE_EXTENSIONS:
+        return "image"
+    return "file"
+
+
 def entry_title(entry: Entry) -> str:
-    return normalize_terms(entry.path.stem) or entry.path.name
+    title = normalize_terms(entry.path.stem) or entry.path.name
+    if title_is_informative(title):
+        return title
+    return entry_kind_label(entry.path)
 
 
-def entry_content(entry: Entry) -> str:
-    """Build the descriptive text used to embed an entry."""
+def entry_content(entry: Entry, exclude_tag_ids: Collection[int] = ()) -> str:
+    """Build the descriptive text used to embed an entry.
+
+    ``exclude_tag_ids`` hides tags from the embedded text. Evaluation uses it to
+    measure how well an entry is scored without the tag it should recover.
+    """
     parts: list[str] = []
 
     parent = entry.path.parent
     if parent.parts and str(parent) not in ("", "."):
         parts.append(f"Folder: {normalize_terms(parent.as_posix())}")
 
-    tag_names = sorted(tag.name for tag in entry.tags if tag.name)
+    excluded = set(exclude_tag_ids)
+    tag_names = sorted(tag.name for tag in entry.tags if tag.name and tag.id not in excluded)
     if tag_names:
         parts.append(f"Tags: {', '.join(tag_names)}")
 
-    for field in entry.text_fields:
-        if field.value and field.value.strip():
-            parts.append(f"{field.name}: {field.value.strip()}")
+    for text_field in entry.text_fields:
+        if text_field.value and text_field.value.strip():
+            parts.append(f"{text_field.name}: {text_field.value.strip()}")
 
     text = "\n".join(parts)
     return text[:MAX_ENTRY_TEXT_LENGTH]
@@ -325,37 +459,225 @@ def entry_search_text(entry: Entry) -> str:
     return f"title: {entry_title(entry)} | text: {text or entry_title(entry)}"
 
 
-def entry_tagging_text(entry: Entry) -> str:
+def entry_tagging_text(entry: Entry, exclude_tag_ids: Collection[int] = ()) -> str:
     content = f"File: {entry_title(entry)}"
-    extra = entry_content(entry)
+    extra = entry_content(entry, exclude_tag_ids)
     if extra:
         content = f"{content}\n{extra}"
     return CLASSIFICATION_PREFIX + content[:MAX_ENTRY_TEXT_LENGTH]
 
 
 def tag_label(tag: Tag) -> str:
-    """Build the classification label text for a tag."""
+    """Build the classification label text for a tag.
+
+    Parent tags are deliberately left out: siblings such as ``Indoors`` and
+    ``Outdoors`` under the same category would otherwise share almost all of
+    their label text and become impossible to tell apart. Hierarchy is used when
+    selecting suggestions instead, see :func:`tag_facets`.
+    """
     aliases = sorted({alias.name for alias in tag.aliases if alias.name})
-    parents = sorted({parent.name for parent in tag.parent_tags if parent.name})
 
     label = tag.name
     if aliases:
         label += f" (also known as: {', '.join(aliases)})"
-    if parents:
-        label += f". Category: {', '.join(parents)}"
     return CLASSIFICATION_PREFIX + label
 
 
-def image_path_for_entry(entry: Entry, library_dir: Path | None) -> Path | None:
+def tag_facets(tags: Iterable[Tag]) -> dict[int, frozenset[int]]:
+    """Map each tag id to the ids of its parent tags.
+
+    Tags sharing a parent describe the same facet of an entry (``Indoors`` and
+    ``Outdoors`` under ``Setting``, for example), so they compete for one slot.
+    Tags without parents belong to no facet and never compete.
+    """
+    facets: dict[int, frozenset[int]] = {}
+    for tag in tags:
+        if tag.id is None:
+            continue
+        facets[int(tag.id)] = frozenset(
+            parent.id for parent in tag.parent_tags if parent.id is not None
+        )
+    return facets
+
+
+def tag_hubness(tag_vectors: np.ndarray, sample: np.ndarray) -> np.ndarray | None:
+    """Return how similar each candidate tag typically is to the library's files.
+
+    This is the cross-domain term of CSLS (cross-domain similarity local scaling),
+    the standard remedy for hubness in image-to-text retrieval. A tag that sits in a
+    dense region of the embedding space — a long alias list, a very broad concept —
+    is close to almost every file, and subtracting its own typical similarity stops
+    it from winning every comparison.
+    """
+    if sample.ndim != 2 or sample.shape[0] < HUB_MIN_SAMPLE:
+        return None
+    if sample.shape[0] > HUB_SAMPLE_LIMIT:
+        step = max(1, sample.shape[0] // HUB_SAMPLE_LIMIT)
+        sample = sample[::step][:HUB_SAMPLE_LIMIT]
+
+    similarities = sample @ tag_vectors.T
+    neighbours = min(HUB_NEIGHBOURS, similarities.shape[0])
+    return np.sort(similarities, axis=0)[-neighbours:].mean(axis=0)
+
+
+def select_tag_suggestions(
+    scores: np.ndarray,
+    tags: Sequence[Tag],
+    *,
+    threshold: float,
+    max_per_entry: int,
+    existing_tag_ids: Collection[int] = (),
+    facets: Mapping[int, frozenset[int]] | None = None,
+    one_per_facet: bool = True,
+    raw_scores: np.ndarray | None = None,
+    min_margin: float | None = None,
+) -> list[tuple[Tag, float]]:
+    """Pick the best-scoring tags for a single entry.
+
+    ``scores`` holds one value per tag, parallel to ``tags``, and decides the order.
+    When ``one_per_facet`` is set, at most one tag is kept per parent tag, and facets
+    already filled by the entry's existing tags are skipped entirely. This keeps
+    mutually exclusive siblings from being suggested together.
+
+    ``raw_scores`` are the plain similarities used for the ``threshold`` check and for
+    the reported score, so ``scores`` can hold a hubness-corrected ranking without
+    changing what the numbers in the UI mean. ``min_margin`` additionally drops tags
+    whose ranking value falls below it, which is how hub tags are filtered out.
+    """
+    if len(scores) != len(tags):
+        raise ValueError("Expected one score per candidate tag.")
+    display = scores if raw_scores is None else raw_scores
+    if len(display) != len(tags):
+        raise ValueError("Expected one raw score per candidate tag.")
+
+    existing = {int(tag_id) for tag_id in existing_tag_ids}
+    facets = facets if facets is not None else {}
+
+    claimed: set[int] = set()
+    if one_per_facet:
+        for tag_id in existing:
+            claimed |= facets.get(tag_id, frozenset())
+
+    selected: list[tuple[Tag, float]] = []
+    for index in np.argsort(-scores):
+        position = int(index)
+        if len(selected) >= max_per_entry:
+            break
+        if min_margin is not None and float(scores[position]) < min_margin:
+            break
+        if float(display[position]) < threshold:
+            continue
+
+        tag = tags[position]
+        if tag.id is None or int(tag.id) in existing:
+            continue
+
+        if one_per_facet:
+            tag_facet_ids = facets.get(int(tag.id), frozenset())
+            if tag_facet_ids & claimed:
+                continue
+            claimed |= tag_facet_ids
+
+        selected.append((tag, float(display[position])))
+
+    return selected
+
+
+def frame_cache_dir(library_dir: Path | None) -> Path | None:
+    """Return the folder where extracted video frames are cached."""
     if library_dir is None:
         return None
-    ext = entry.path.suffix.lower()
-    if ext not in IMAGE_EXTENSIONS:
+    return Path(library_dir) / TS_FOLDER_NAME / FRAME_CACHE_FOLDER_NAME
+
+
+def _extract_video_frame(path: Path, cache_dir: Path) -> Path | None:
+    """Decode and cache one representative frame from a video."""
+    try:
+        stat = path.stat()
+    except OSError:
         return None
-    path = library_dir / entry.path
+
+    digest = hashlib.sha1(
+        f"{path.as_posix()}:{stat.st_size}:{stat.st_mtime_ns}".encode()
+    ).hexdigest()
+    target = cache_dir / f"{digest}.png"
+    if target.is_file():
+        return target
+
+    try:
+        import cv2  # pyright: ignore[reportMissingImports]
+    except ImportError:
+        logger.info("[Embeddings] OpenCV is unavailable, using text only for videos")
+        return None
+
+    capture = None
+    frame = None
+    try:
+        capture = cv2.VideoCapture(str(path), cv2.CAP_FFMPEG)
+        total_frames = capture.get(cv2.CAP_PROP_FRAME_COUNT)
+        if total_frames and total_frames > 0:
+            # Seek to the middle; that frame best represents the whole clip.
+            capture.set(cv2.CAP_PROP_POS_FRAMES, int(total_frames // 2))
+            read_ok, frame = capture.read()
+            if not read_ok or frame is None:
+                frame = None
+                for index in range(min(10, int(total_frames))):
+                    capture.set(cv2.CAP_PROP_POS_FRAMES, index)
+                    read_ok, frame = capture.read()
+                    if read_ok and frame is not None:
+                        break
+        else:
+            read_ok, frame = capture.read()
+            if not read_ok:
+                frame = None
+
+        if frame is None:
+            return None
+
+        height, width = frame.shape[:2]
+        longest = max(height, width)
+        if longest > FRAME_LONGEST_SIDE:
+            scale = FRAME_LONGEST_SIDE / longest
+            frame = cv2.resize(frame, (max(1, int(width * scale)), max(1, int(height * scale))))
+
+        encoded_ok, buffer = cv2.imencode(".png", frame)
+        if not encoded_ok:
+            return None
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(buffer.tobytes())
+    except Exception as e:
+        logger.warning("[Embeddings] Could not extract a video frame", path=path, error=e)
+        return None
+    finally:
+        if capture is not None:
+            capture.release()
+
+    return target
+
+
+def media_path_for_entry(
+    entry: Entry, library_dir: Path | None, cache_dir: Path | None = None
+) -> Path | None:
+    """Return an image file the vision encoder can read for this entry.
+
+    Images are used as-is. Videos previously had no visual input at all, so a clip
+    was embedded from its filename alone and looked identical to every other clip;
+    its middle frame is extracted and cached instead.
+    """
+    if library_dir is None:
+        return None
+    path = Path(library_dir) / entry.path
     if not path.is_file():
         return None
-    return path
+
+    ext = entry.path.suffix.lower()
+    if ext in IMAGE_EXTENSIONS:
+        return path
+    if ext in VIDEO_EXTENSIONS:
+        if cache_dir is None:
+            return None
+        return _extract_video_frame(path, cache_dir)
+    return None
 
 
 def build_entry_input(
@@ -363,15 +685,27 @@ def build_entry_input(
     task: str,
     library_dir: Path | None,
     use_images: bool,
+    exclude_tag_ids: Collection[int] = (),
+    cache_dir: Path | None = None,
 ) -> tuple[EntryEmbeddingInput, str]:
     """Return the model input and a content hash for an entry."""
-    text = entry_search_text(entry) if task == TASK_SEARCH else entry_tagging_text(entry)
-    image_path = image_path_for_entry(entry, library_dir) if use_images else None
+    text = (
+        entry_search_text(entry)
+        if task == TASK_SEARCH
+        else entry_tagging_text(entry, exclude_tag_ids)
+    )
+    image_path = media_path_for_entry(entry, library_dir, cache_dir) if use_images else None
 
     image_fingerprint = ""
     if image_path is not None:
-        stat = image_path.stat()
-        image_fingerprint = f"{image_path.as_posix()}:{stat.st_size}:{stat.st_mtime_ns}"
+        # Fingerprint the source file, not a cached frame, so regenerating frames
+        # never looks like the entry itself changed.
+        try:
+            source = Path(library_dir) / entry.path if library_dir is not None else image_path
+            stat = source.stat()
+            image_fingerprint = f"{source.as_posix()}:{stat.st_size}:{stat.st_mtime_ns}"
+        except OSError:
+            image_fingerprint = image_path.as_posix()
         model_input: EntryEmbeddingInput = {
             "text": f"{text} <|image|>",
             "image": str(image_path),
@@ -463,7 +797,11 @@ class SemanticIndex:
         for entry in entries:
             try:
                 model_input, content_hash = build_entry_input(
-                    entry, TASK_SEARCH, self.library.library_dir, self.config.use_images
+                    entry,
+                    TASK_SEARCH,
+                    self.library.library_dir,
+                    self.config.use_images,
+                    cache_dir=self._frame_cache_dir(),
                 )
             except OSError as e:
                 logger.warning(
@@ -555,9 +893,14 @@ class SemanticIndex:
         order = np.argsort(-scores)
         return [ids[int(i)] for i in order]
 
-    def _candidate_tags(self) -> list[Tag]:
+    def candidate_tags(self, all_tags: Sequence[Tag] | None = None) -> list[Tag]:
+        """Return the tags that auto-tagging may suggest.
+
+        Categories, hidden tags and reserved tags are excluded. Passing
+        ``all_tags`` reuses an already loaded tag list.
+        """
         tags = []
-        for tag in self.library.tags:
+        for tag in self.library.tags if all_tags is None else all_tags:
             if tag.id is None or tag.id <= RESERVED_TAG_END:
                 continue
             if tag.is_category or tag.is_hidden or not tag.name:
@@ -575,7 +918,6 @@ class SemanticIndex:
                     tag.id,
                     tag.name,
                     tuple(sorted(alias.name for alias in tag.aliases if alias.name)),
-                    tuple(sorted(parent.name for parent in tag.parent_tags if parent.name)),
                 )
                 for tag in tags
             ),
@@ -589,6 +931,19 @@ class SemanticIndex:
         self._tag_cache_key = signature
         self._tag_cache = (list(tags), vectors)
         return self._tag_cache
+
+    def _frame_cache_dir(self) -> Path | None:
+        return frame_cache_dir(self.library.library_dir)
+
+    def _hubness(self, tag_vectors: np.ndarray) -> np.ndarray | None:
+        """How close each tag generally is to this library's files."""
+        _ids, sample = self.library.load_entry_embedding_vectors(
+            self.config.model,
+            TASK_TAGGING,
+            self.config.dimensions,
+            include_hidden=True,
+        )
+        return tag_hubness(tag_vectors, sample)
 
     def _ensure_tagging_embeddings(
         self,
@@ -615,7 +970,11 @@ class SemanticIndex:
         for entry in entries:
             try:
                 model_input, content_hash = build_entry_input(
-                    entry, TASK_TAGGING, self.library.library_dir, self.config.use_images
+                    entry,
+                    TASK_TAGGING,
+                    self.library.library_dir,
+                    self.config.use_images,
+                    cache_dir=self._frame_cache_dir(),
                 )
             except OSError as e:
                 logger.warning(
@@ -678,42 +1037,71 @@ class SemanticIndex:
         *,
         threshold: float = 0.6,
         max_per_entry: int = 5,
+        one_per_facet: bool = True,
+        use_hubness: bool = True,
         progress: ProgressCallback | None = None,
         should_cancel: CancelCallback | None = None,
-    ) -> list[AutoTagSuggestion]:
-        """Suggest tags for one or more entries using semantic similarity."""
+    ) -> AutoTagResult:
+        """Suggest tags for one or more entries using semantic similarity.
+
+        Files with nothing to look at — an unreadable video with a camera-generated
+        name — are reported in :attr:`AutoTagResult.unsuggested` instead of being
+        given tags chosen from noise.
+        """
         if not entry_ids:
-            return []
+            return AutoTagResult()
 
         entries = self.library.get_entries_for_embedding(entry_ids)
         if not entries:
-            return []
+            return AutoTagResult()
 
-        tags = self._candidate_tags()
+        all_tags = self.library.tags
+        tags = self.candidate_tags(all_tags)
         if not tags:
-            return []
+            return AutoTagResult()
 
+        facets = tag_facets(all_tags)
         _tags, tag_vectors = self._tag_embeddings(tags)
         entry_vectors = self._ensure_tagging_embeddings(entries, progress, should_cancel)
+        hubness = self._hubness(tag_vectors) if use_hubness else None
 
         suggestions: list[AutoTagSuggestion] = []
+        unsuggested: list[tuple[int, str]] = []
         for entry in entries:
             if should_cancel and should_cancel():
                 break
             entry_vector = entry_vectors.get(entry.id)
             if entry_vector is None:
+                unsuggested.append((entry.id, entry.path.name))
                 continue
 
-            scores = tag_vectors @ entry_vector
-            existing_tag_ids = {tag.id for tag in entry.tags}
-            added = 0
-            for index in np.argsort(-scores):
-                score = float(scores[int(index)])
-                if score < threshold or added >= max_per_entry:
-                    break
-                tag = tags[int(index)]
-                if tag.id in existing_tag_ids:
-                    continue
+            raw = tag_vectors @ entry_vector
+            if hubness is not None:
+                # Rank by how much more similar this file is to a tag than the
+                # library's files usually are. Hub tags keep their high raw score,
+                # so they can still clear the threshold, but they no longer rank.
+                scores = raw - hubness
+                min_margin: float | None = 0.0
+            else:
+                scores = raw
+                min_margin = None
+
+            selected = select_tag_suggestions(
+                scores,
+                tags,
+                threshold=threshold,
+                max_per_entry=max_per_entry,
+                existing_tag_ids=[tag.id for tag in entry.tags if tag.id is not None],
+                facets=facets,
+                one_per_facet=one_per_facet,
+                raw_scores=raw,
+                min_margin=min_margin,
+            )
+            if not selected:
+                unsuggested.append((entry.id, entry.path.name))
+                continue
+
+            for tag, score in selected:
                 suggestions.append(
                     AutoTagSuggestion(
                         entry_id=entry.id,
@@ -723,10 +1111,9 @@ class SemanticIndex:
                         score=score,
                     )
                 )
-                added += 1
 
         suggestions.sort(key=lambda item: (item.entry_name.lower(), -item.score))
-        return suggestions
+        return AutoTagResult(suggestions=suggestions, unsuggested=unsuggested)
 
     def _record(
         self,
